@@ -47,7 +47,7 @@ git --version
 ### Clone the repository
 
 ```bash
-git clone https://github.com/pashkapo/secondbrain-kit.git
+git clone https://github.com/evidpo/secondbrain-kit.git
 cd secondbrain-kit
 ```
 

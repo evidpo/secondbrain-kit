@@ -43,7 +43,7 @@ You get: a clean, interlinked vault of atomic notes you can search, query, and b
 ### Setup (2 minutes)
 
 ```bash
-git clone https://github.com/pashkapo/secondbrain-kit.git
+git clone https://github.com/evidpo/secondbrain-kit.git
 cd secondbrain-kit
 chmod +x setup.sh
 ./setup.sh

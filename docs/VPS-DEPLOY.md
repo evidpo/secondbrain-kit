@@ -34,7 +34,7 @@ ssh user@your-server-ip
 
 ```bash
 # Clone the kit
-git clone https://github.com/pashkapo/secondbrain-kit.git
+git clone https://github.com/evidpo/secondbrain-kit.git
 cd secondbrain-kit
 
 # Run setup wizard
