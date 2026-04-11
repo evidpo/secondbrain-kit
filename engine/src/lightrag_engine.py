@@ -1,8 +1,10 @@
 """Singleton wrapper around LightRAG with sync API for the watcher pipeline."""
 
 import asyncio
+import hashlib
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 
@@ -219,13 +221,18 @@ def find_doc_id_by_path(rel_path: str) -> str | None:
 
 def strip_frontmatter(text: str) -> str:
     """Remove YAML frontmatter from note (same as reindex script)."""
-    import re
     if not text.startswith("---"):
         return text.strip()
     m = re.match(r"^---\n(.*?)\n---\n*", text, re.DOTALL)
     if m:
         return text[m.end():].strip()
     return text.strip()
+
+
+def compute_doc_id(content: str) -> str:
+    """Canonical doc_id from note content: strip frontmatter, MD5 the body."""
+    body = strip_frontmatter(content)
+    return f"doc-{hashlib.md5(body.encode()).hexdigest()}"
 
 
 def sync_with_vault(vault_path: str, skip_dirs: set[str] | None = None) -> dict:
@@ -235,9 +242,6 @@ def sync_with_vault(vault_path: str, skip_dirs: set[str] | None = None) -> dict:
     Hashes content WITHOUT frontmatter (same as reindex script).
     Returns: {deleted: [doc_ids], kept: int}
     """
-    from pathlib import Path
-    import hashlib
-
     vault = Path(vault_path)
     if skip_dirs is None:
         skip_dirs = {"templates", ".obsidian", ".git", ".lightrag", ".entire", ".trash"}
@@ -253,7 +257,7 @@ def sync_with_vault(vault_path: str, skip_dirs: set[str] | None = None) -> dict:
                 raw = f.read_text(encoding="utf-8").strip()
                 body = strip_frontmatter(raw)
                 if body and len(body) >= 20:
-                    vault_hashes.add(f"doc-{hashlib.md5(body.encode()).hexdigest()}")
+                    vault_hashes.add(compute_doc_id(raw))
             except Exception:
                 continue
 

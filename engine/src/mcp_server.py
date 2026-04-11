@@ -16,7 +16,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-API_URL = os.getenv("SECONDBRAIN_API_URL", "http://localhost:8789")
+API_URL = os.getenv("SECONDBRAIN_API_URL", "https://memory.atom8.site")
 API_KEY = os.getenv("SECONDBRAIN_API_KEY", "")
 
 server = Server("secondbrain")

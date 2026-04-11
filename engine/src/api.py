@@ -19,6 +19,8 @@ from .lightrag_engine import (
 )
 from .processor import process_file
 from .voice import process_voice
+from .lint import run_lint
+from .index_generator import generate_index, write_index
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +63,13 @@ class AskRequest(BaseModel):
     question: str
     mode: str = "mix"
     top_k: int = 10
+    save: bool = False
 
 
 class AskResponse(BaseModel):
     answer: str
     sources: list[dict]
+    saved_as: str | None = None
 
 
 class StatsResponse(BaseModel):
@@ -117,7 +121,35 @@ async def add_note(req: AddRequest, _=Depends(verify_api_key)):
 async def ask_vault(req: AskRequest, _=Depends(verify_api_key)):
     """RAG: knowledge graph + vector search + LLM answer."""
     answer = lightrag_query(req.question, mode=req.mode, top_k=req.top_k)
-    return AskResponse(answer=answer or "No answer found.", sources=[])
+    answer = answer or "No answer found."
+
+    saved_as = None
+    if req.save:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        q_title = req.question[:80].rstrip()
+        note_content = f'''---
+title: "Q: {q_title}"
+type: source
+tags: [qa, synthesis]
+created: {today}
+source: ask
+confidence: 0.8
+---
+
+# Q: {q_title}
+
+{answer}
+'''
+        inbox_dir = Path(os.getenv("VAULT_PATH", "/app/vault")) / os.getenv("INBOX_DIR_NAME", "_inbox")
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        save_path = inbox_dir / f"ask-{timestamp}.md"
+        save_path.write_text(note_content, encoding="utf-8")
+        saved_as = str(save_path)
+        logger.info(f"Saved /ask answer to {save_path}")
+
+    return AskResponse(answer=answer, sources=[], saved_as=saved_as)
 
 
 @app.get("/stats", response_model=StatsResponse)
@@ -187,6 +219,24 @@ async def add_voice_note(
         raise HTTPException(status_code=422, detail="No valuable content in voice message")
 
     return {"status": "ok", "path": result_path}
+
+
+class LintRequest(BaseModel):
+    fix: bool = False
+
+
+@app.post("/lint")
+async def lint_vault(req: LintRequest, _=Depends(verify_api_key)):
+    """Run 7 integrity checks on vault ↔ LightRAG consistency."""
+    return run_lint(fix=req.fix)
+
+
+@app.get("/index")
+async def get_index(_=Depends(verify_api_key)):
+    """Generate and return vault index for Claude Code context injection."""
+    content = generate_index()
+    write_index()
+    return {"index": content}
 
 
 @app.post("/sync")

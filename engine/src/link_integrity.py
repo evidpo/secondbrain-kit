@@ -1,6 +1,5 @@
 """Link integrity: detect deleted notes and clean broken [[wiki-links]] across vault."""
 
-import hashlib
 import json
 import logging
 import os
@@ -47,7 +46,7 @@ def register_title(doc_id: str, title: str) -> None:
 
 def rebuild_title_index(vault_path: str) -> dict[str, str]:
     """Full rebuild: scan vault, compute doc_id from body hash, extract title from frontmatter."""
-    from .lightrag_engine import strip_frontmatter
+    from .lightrag_engine import strip_frontmatter, compute_doc_id
 
     vault = Path(vault_path)
     index: dict[str, str] = {}
@@ -61,7 +60,7 @@ def rebuild_title_index(vault_path: str) -> dict[str, str]:
                 body = strip_frontmatter(raw)
                 if not body or len(body) < 20:
                     continue
-                doc_id = f"doc-{hashlib.md5(body.encode()).hexdigest()}"
+                doc_id = compute_doc_id(raw)
                 # Extract title from YAML frontmatter
                 title = _extract_title(raw, f)
                 if title:
@@ -117,9 +116,11 @@ def scan_broken_links(vault_path: str, deleted_titles: list[str]) -> dict[str, l
             continue
         found = []
         for match in WIKI_LINK_RE.finditer(content):
-            link_text = match.group(1).strip()
-            if link_text.lower() in lower_titles:
-                found.append(lower_titles[link_text.lower()])
+            raw_link = match.group(1).strip()
+            # Extract base title: split on # (anchor) and | (display text)
+            base_title = raw_link.split("#")[0].split("|")[0].strip()
+            if base_title.lower() in lower_titles:
+                found.append(lower_titles[base_title.lower()])
         if found:
             broken[str(f)] = list(set(found))
 
@@ -144,13 +145,13 @@ def clean_broken_links(broken_map: dict[str, list[str]]) -> int:
         for title in titles:
             escaped = re.escape(title)
 
-            # Remove lines in Links/References sections: `- [[Title]]`
-            pattern = re.compile(rf"^\s*-\s*\[\[{escaped}\]\]\s*\n?", re.MULTILINE | re.IGNORECASE)
+            # Remove lines in Links/References sections: `- [[Title]]` (also with #anchor or |display)
+            pattern = re.compile(rf"^\s*-\s*\[\[{escaped}(?:[#|][^\]]*)?\]\]\s*\n?", re.MULTILINE | re.IGNORECASE)
             content, n = pattern.subn("", content)
             cleaned_count += n
 
-            # Replace remaining inline [[Title]] with plain Title
-            inline_pattern = re.compile(rf"\[\[{escaped}\]\]", re.IGNORECASE)
+            # Replace remaining inline [[Title]] (also with #anchor or |display) with plain Title
+            inline_pattern = re.compile(rf"\[\[{escaped}(?:[#|][^\]]*)?\]\]", re.IGNORECASE)
             content, n2 = inline_pattern.subn(title, content)
             cleaned_count += n2
 

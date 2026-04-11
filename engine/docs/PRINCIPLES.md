@@ -46,6 +46,13 @@ Better to miss something useful than to store garbage.
 - Human decides: creating new folders, new tag categories.
 - Daemon NEVER creates folders.
 
+### S4: Link Integrity
+- Every wiki-link MUST point to an existing note at creation time.
+- Orphan notes (no incoming or outgoing links) are flagged `needs_review: true`.
+- Dead links cleaned within 5 minutes of note deletion (graph_sync cycle).
+- `/lint` verifies full vault ↔ LightRAG consistency on demand.
+- Bidirectional sync: vault files ↔ LightRAG docs, wiki-links ↔ note titles.
+
 ---
 
 ## QUALITY CONTROL (enforcement layers)

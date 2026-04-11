@@ -29,7 +29,7 @@ _SKIP_DIRS = {"templates", ".obsidian", ".git", ".lightrag", ".entire", ".trash"
 _CACHE_FILE = os.path.join(VAULT_PATH, ".frontmatter_cache.json")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_DM_CHAT_ID", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_DM_CHAT_ID", "166009183")
 
 
 # ---------------------------------------------------------------------------

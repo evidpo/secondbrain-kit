@@ -45,6 +45,11 @@ def _scan_existing_notes(vault_path: str) -> list[str]:
     return notes
 
 
+def get_existing_note_titles(vault_path: str) -> list[str]:
+    """Public API: get all note titles in vault."""
+    return _scan_existing_notes(vault_path)
+
+
 def _scan_existing_tags(vault_path: str) -> set[str]:
     """Get set of all tags used in vault (cached)."""
     global _existing_tags_cache

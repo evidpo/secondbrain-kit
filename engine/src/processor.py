@@ -13,7 +13,7 @@ import yaml
 
 from .gate import run_all_gates, check_title_exists, mark_processed
 from .lightrag_engine import insert as lightrag_insert, find_similar
-from .linker import analyze, evaluate_value, merge_notes, invalidate_cache
+from .linker import analyze, evaluate_value, merge_notes, invalidate_cache, get_existing_note_titles
 
 logger = logging.getLogger(__name__)
 
@@ -24,12 +24,9 @@ INBOX_DIR_NAME = os.getenv("INBOX_DIR_NAME", "_inbox")
 def _register_doc_title(content: str, title: str) -> None:
     """Register doc_id → title mapping for link integrity tracking."""
     try:
-        import hashlib
-        from .lightrag_engine import strip_frontmatter
+        from .lightrag_engine import compute_doc_id
         from .link_integrity import register_title
-        body = strip_frontmatter(content)
-        doc_id = f"doc-{hashlib.md5(body.encode()).hexdigest()}"
-        register_title(doc_id, title)
+        register_title(compute_doc_id(content), title)
     except Exception:
         pass
 
@@ -280,6 +277,13 @@ def _create_new_note(raw_text: str, inbox_path: Path, source: str = "unknown") -
     analysis = analyze(raw_text, VAULT_PATH)
     analysis["source"] = source
     confidence = analysis.get("confidence", 0.5)
+
+    # Validate links — only keep links to existing notes (S4: link integrity)
+    existing_titles = {t.lower() for t in get_existing_note_titles(VAULT_PATH)}
+    analysis["links"] = [
+        link for link in analysis.get("links", [])
+        if link.lower() in existing_titles
+    ]
 
     # Determine target folder (S2: closed vocabulary)
     vault = Path(VAULT_PATH)
