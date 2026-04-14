@@ -11,7 +11,9 @@ from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileCreatedEvent
 
+from .approval import APPROVAL_MODE, handle_callback, cleanup_stale
 from .processor import process_file
+from .telegram import notify_inbox, notify_orphans, cleanup_system_notifications
 from .lightrag_engine import (
     get_instance, shutdown, sync_with_vault,
     insert as lightrag_insert, delete_doc, strip_frontmatter,
@@ -39,8 +41,11 @@ VAULT_PATH = os.getenv("VAULT_PATH", "/app/vault")
 INBOX_DIR_NAME = os.getenv("INBOX_DIR_NAME", "_inbox")
 INBOX_DIR = os.path.join(VAULT_PATH, INBOX_DIR_NAME)
 RETRY_DELAY = 300  # 5 minutes
-SYNC_INTERVAL = 300  # 5 minutes — sync graph with vault (delete orphans)
+SYNC_INTERVAL = 300  # 5 minutes — check graph for orphans (notify, no auto-delete)
 PATH_SYNC_INTERVAL = 30  # 30 seconds — check for renames/title changes
+REINDEX_CHANGE_THRESHOLD = int(os.getenv("REINDEX_CHANGE_THRESHOLD", "20"))  # auto-reindex after N changes
+STALE_CHECK_INTERVAL = 3600  # 1 hour — check for stale approvals
+DAILY_CLEANUP_INTERVAL = 86400  # 24 hours — purge accumulated system notifications
 
 
 class InboxHandler(FileSystemEventHandler):
@@ -211,12 +216,16 @@ class VaultHandler(FileSystemEventHandler):
         for path in to_delete:
             try:
                 rel_path = os.path.relpath(path, VAULT_PATH)
-                if _delete_by_path(rel_path):
-                    deleted += 1
-                    logger.info("Reactive delete: %s", rel_path)
-                # If not found by path, sync_with_vault fallback will catch it
+                logger.info("File removed from vault (not deleting from graph): %s", rel_path)
+                notify_inbox(
+                    f"🗑 <b>Файл удалён из vault</b>\n"
+                    f"<code>{rel_path}</code>\n"
+                    f"Запись в графе сохранена. Удалить из графа вручную: "
+                    f"<code>POST /reindex-sync</code>"
+                )
+                deleted += 1
             except Exception as e:
-                logger.warning("Reactive delete failed for %s: %s", path, e)
+                logger.warning("Delete notify failed for %s: %s", path, e)
 
         return {"inserted": inserted, "deleted": deleted}
 
@@ -261,6 +270,76 @@ def start_watcher() -> None:
     # Process existing inbox files
     process_existing_inbox()
 
+    # Full vault reindex on startup (background thread — non-blocking)
+    def _startup_reindex():
+        from .lightrag_engine import get_instance
+        from .index_generator import write_index
+
+        vault = Path(VAULT_PATH)
+        skip = {"templates", ".obsidian", ".git", ".lightrag", ".entire", ".trash", "_system"}
+        indexed = 0
+        skipped = 0
+        errors = 0
+
+        # Load current doc_status to skip already-processed docs (by file path)
+        try:
+            rag = get_instance()
+            processed_paths = {
+                info.get("file_path")
+                for info in (rag.doc_status._data or {}).values()
+                if isinstance(info, dict) and info.get("status") == "processed"
+                and info.get("file_path")
+            }
+        except Exception:
+            processed_paths = set()
+
+        for d in vault.iterdir():
+            if not d.is_dir() or d.name in skip or d.name.startswith("."):
+                continue
+            if d.name == INBOX_DIR_NAME:
+                continue
+            for f in d.rglob("*.md"):
+                if f.name.startswith("."):
+                    continue
+                try:
+                    rel_path = str(f.relative_to(vault))
+                    if rel_path in processed_paths:
+                        skipped += 1
+                        continue
+                    content = f.read_text(encoding="utf-8")
+                    lightrag_insert(content, file_path=rel_path)
+                    indexed += 1
+                except Exception as e:
+                    logger.warning("Startup reindex failed for %s: %s", f, e)
+                    errors += 1
+
+        logger.info(
+            "Startup reindex: %d new, %d already indexed, %d errors",
+            indexed, skipped, errors,
+        )
+        if indexed:
+            notify_inbox(f"🔄 Реиндекс при старте: {indexed} новых заметок")
+
+        # Sync wiki-links after reindex so Obsidian graph stays in sync
+        try:
+            from .api import _sync_all_links
+            link_result = _sync_all_links()
+            added = link_result.get("total_links_added", 0)
+            if added:
+                logger.info("Startup link sync: %d links added to %d notes",
+                            added, len(link_result.get("notes_updated", [])))
+        except Exception as e:
+            logger.warning("Startup link sync failed: %s", e)
+
+        # Regenerate _index.md after reindex + link sync
+        try:
+            write_index(VAULT_PATH)
+            logger.info("_index.md updated")
+        except Exception as e:
+            logger.warning("Index write failed: %s", e)
+
+    threading.Thread(target=_startup_reindex, daemon=True, name="startup-reindex").start()
+
     # Inbox watcher
     inbox_handler = InboxHandler()
     observer = Observer()
@@ -273,8 +352,15 @@ def start_watcher() -> None:
     observer.start()
     logger.info("Watching inbox + vault for changes...")
 
+    # Callbacks arrive via HTTP POST /telegram/callback from openclaw-gateway.
+    # Do NOT start a local getUpdates poll — it conflicts with the main bot (sa_bot).
+
     last_graph_sync = time.time()
     last_path_sync = time.time()
+    last_stale_check = time.time()
+    last_daily_cleanup = time.time()
+    change_counter = 0  # track vault changes for threshold-based reindex
+    _last_orphan_set: frozenset[str] = frozenset()  # dedup: skip if same orphans as last time
 
     try:
         while True:
@@ -284,10 +370,26 @@ def start_watcher() -> None:
             # Flush batched create/delete events (reactive graph sync)
             pending = vault_handler.flush_pending()
             if pending["inserted"] or pending["deleted"]:
+                change_counter += pending["inserted"] + pending["deleted"]
                 logger.info(
-                    "Reactive sync: %d inserted, %d deleted",
-                    pending["inserted"], pending["deleted"],
+                    "Reactive sync: %d inserted, %d removed (total changes: %d)",
+                    pending["inserted"], pending["deleted"], change_counter,
                 )
+
+            # Threshold-based reindex: when enough changes accumulate
+            if change_counter >= REINDEX_CHANGE_THRESHOLD:
+                logger.info("Change threshold reached (%d), triggering reindex", change_counter)
+                change_counter = 0
+                def _threshold_reindex():
+                    from .api import _reindex_vault
+                    try:
+                        result = _reindex_vault()
+                        logger.info("Threshold reindex: %d indexed", result["indexed"])
+                        notify_inbox(f"🔄 Авто-реиндекс ({REINDEX_CHANGE_THRESHOLD}+ изменений): "
+                                  f"{result['indexed']} заметок")
+                    except Exception as e:
+                        logger.warning("Threshold reindex failed: %s", e)
+                threading.Thread(target=_threshold_reindex, daemon=True).start()
 
             now = time.time()
 
@@ -298,6 +400,7 @@ def start_watcher() -> None:
                     renames = len(result.get("renames", []))
                     changes = len(result.get("title_changes", []))
                     if renames or changes:
+                        change_counter += renames + changes
                         logger.info(
                             "Path sync: %d renames, %d title changes", renames, changes
                         )
@@ -305,25 +408,50 @@ def start_watcher() -> None:
                     logger.warning(f"Path sync failed: {e}")
                 last_path_sync = now
 
-            # Periodic graph sync: remove docs for deleted vault files
+            # Periodic graph sync: detect orphans + TTL cleanup of old notifications
             if now - last_graph_sync >= SYNC_INTERVAL:
                 try:
-                    result = sync_with_vault(VAULT_PATH)
-                    if result["deleted"]:
-                        logger.info(f"Graph sync: removed {len(result['deleted'])} orphan docs")
-                        try:
-                            from .link_integrity import run_link_integrity
-                            integrity = run_link_integrity(VAULT_PATH, result["deleted"])
-                            if integrity["files_cleaned"]:
-                                logger.info(
-                                    "Link integrity: cleaned %d links in %d files",
-                                    integrity["links_removed"], integrity["files_cleaned"],
-                                )
-                        except Exception as e:
-                            logger.warning(f"Link integrity failed: {e}")
+                    result = sync_with_vault(VAULT_PATH, dry_run=True)
+                    orphans = result.get("orphans", [])
+                    current_set = frozenset(orphans)
+                    if orphans and current_set != _last_orphan_set:
+                        logger.info("Graph sync: %d orphan docs found (not deleted)", len(orphans))
+                        notify_orphans(orphans)
+                        _last_orphan_set = current_set
+                    elif not orphans and _last_orphan_set:
+                        logger.info("Graph sync: all orphans resolved")
+                        _last_orphan_set = frozenset()
                 except Exception as e:
                     logger.warning(f"Graph sync failed: {e}")
+
+                # TTL cleanup: delete notifications older than NOTIF_TTL
+                try:
+                    from .telegram import NOTIF_TTL
+                    cleanup_system_notifications(max_age=NOTIF_TTL)
+                except Exception as e:
+                    logger.warning("TTL cleanup failed: %s", e)
+
                 last_graph_sync = now
+
+            # Daily cleanup: force-delete ALL remaining notifications, reset state
+            if now - last_daily_cleanup >= DAILY_CLEANUP_INTERVAL:
+                try:
+                    deleted = cleanup_system_notifications(max_age=None)
+                    logger.info("Daily cleanup: removed %d old notifications", deleted)
+                    _last_orphan_set = frozenset()
+                except Exception as e:
+                    logger.warning("Daily cleanup failed: %s", e)
+                last_daily_cleanup = now
+
+            # Stale approval cleanup
+            if APPROVAL_MODE == "approve" and now - last_stale_check >= STALE_CHECK_INTERVAL:
+                try:
+                    refreshed = cleanup_stale()
+                    if refreshed:
+                        logger.info("Stale approvals refreshed: %d", refreshed)
+                except Exception as e:
+                    logger.warning("Stale cleanup failed: %s", e)
+                last_stale_check = now
     except KeyboardInterrupt:
         logger.info("Shutting down...")
         observer.stop()

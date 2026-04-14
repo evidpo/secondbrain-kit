@@ -88,6 +88,7 @@ def submit_for_approval(
         needs_folder=needs_folder,
         suggested_folder=suggested_folder,
         new_type_label=new_type_label,
+        filename=filename,
         new_type_reason=new_type_reason,
     )
     cb_slug = slug[:30]
@@ -160,9 +161,29 @@ def handle_callback(
     callback_id: str, chat_id: str, message_id: int,
 ) -> None:
     """Handle Telegram inline button callback."""
+    # Dismiss system notifications
+    if action == "d":
+        answer_callback(callback_id, "✓")
+        delete_message(chat_id, message_id)
+        return
+
+    # Delete orphan docs from graph
+    if action == "o" and slug == "delete":
+        try:
+            from .lightrag_engine import sync_with_vault
+            result = sync_with_vault(VAULT_PATH, dry_run=False)
+            deleted = len(result.get("deleted", []))
+            answer_callback(callback_id, f"🗑 Удалено {deleted}")
+            edit_message(chat_id, message_id, f"✅ Удалено {deleted} сирот из графа")
+        except Exception as e:
+            logger.error("Orphan delete failed: %s", e)
+            answer_callback(callback_id, "❌ Ошибка удаления")
+        return
+
     entry = _queue.get(slug)
     if not entry:
         answer_callback(callback_id, "⚠️ Заметка не найдена")
+        delete_message(chat_id, message_id)
         return
 
     vault = Path(VAULT_PATH)
@@ -173,6 +194,7 @@ def handle_callback(
 
     if not source_path.exists():
         answer_callback(callback_id, "⚠️ Файл удалён")
+        delete_message(chat_id, message_id)
         _queue.remove(slug)
         return
 
@@ -207,17 +229,15 @@ def handle_callback(
             _update_forward_links(target_path, existing_links)
             _inject_backlinks_for_note(title, existing_links)
 
-        answer_callback(callback_id, f"✅ {title}")
-        edit_message(chat_id, message_id,
-                     f"✅ <b>Одобрено</b>\n{title}\n📁 {folder}")
+        answer_callback(callback_id, f"✅ {title} → {folder}")
+        delete_message(chat_id, message_id)
         _queue.remove(slug)
 
     elif action == "r":
         # Reject: delete file
         source_path.unlink()
-        answer_callback(callback_id, f"❌ {title}")
-        edit_message(chat_id, message_id,
-                     f"❌ <b>Отклонено</b>\n{title}")
+        answer_callback(callback_id, f"❌ Удалено: {title}")
+        delete_message(chat_id, message_id)
         _queue.remove(slug)
         logger.info("Rejected: %s", title)
 
@@ -249,17 +269,15 @@ def handle_callback(
             _update_forward_links(target_path, existing_links)
             _inject_backlinks_for_note(title, existing_links)
 
-        answer_callback(callback_id, f"📂 {folder}")
-        edit_message(chat_id, message_id,
-                     f"📂 <b>Создано</b>\n{title}\n📁 {folder}")
+        answer_callback(callback_id, f"📂 {title} → {folder}")
+        delete_message(chat_id, message_id)
         _queue.remove(slug)
         logger.info("Created folder + moved: %s → %s", title, folder)
 
     elif action == "k":
         # Keep in inbox for manual editing
-        answer_callback(callback_id, f"📁 Оставлено в inbox")
-        edit_message(chat_id, message_id,
-                     f"📁 <b>В inbox</b>\n{title}\nОтредактируй и перемести вручную")
+        answer_callback(callback_id, f"📁 {title} — в inbox")
+        delete_message(chat_id, message_id)
         _queue.remove(slug)
         logger.info("Kept in inbox: %s", title)
 
@@ -318,6 +336,7 @@ def cleanup_stale() -> int:
             needs_folder=entry.get("needs_folder", False),
             new_type_label=entry.get("new_type_label", ""),
             new_type_reason=entry.get("new_type_reason", ""),
+            filename=entry.get("filename", ""),
         )
         entry["message_id"] = new_msg_id
         entry["created_at"] = now

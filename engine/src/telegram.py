@@ -14,6 +14,66 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_DM_CHAT_ID = os.getenv("TELEGRAM_DM_CHAT_ID", "")
 TELEGRAM_INBOX_CHAT_ID = os.getenv("TELEGRAM_INBOX_CHAT_ID", "")
 TELEGRAM_INBOX_THREAD_ID = os.getenv("TELEGRAM_INBOX_THREAD_ID", "")
+VAULT_GITHUB_URL = "https://github.com/evidpo/SecondBrain/blob/main"
+
+_NOTIF_STORE = "/tmp/sb_notifications.json"
+NOTIF_TTL = int(os.getenv("NOTIF_TTL_SECONDS", str(2 * 3600)))  # auto-delete after 2h
+
+
+def _load_notif_store() -> dict[str, float]:
+    """Load {message_id_str: sent_at_timestamp} store."""
+    try:
+        if os.path.exists(_NOTIF_STORE):
+            return json.loads(open(_NOTIF_STORE).read())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_notif_store(store: dict[str, float]) -> None:
+    try:
+        with open(_NOTIF_STORE, "w") as f:
+            f.write(json.dumps(store))
+    except Exception:
+        pass
+
+
+def _track_notif(message_id: int | None) -> None:
+    if not message_id:
+        return
+    store = _load_notif_store()
+    store[str(message_id)] = time.time()
+    _save_notif_store(store)
+
+
+def cleanup_system_notifications(max_age: int | None = None) -> int:
+    """Delete tracked system notifications older than max_age seconds.
+
+    If max_age is None, deletes ALL tracked notifications (daily cleanup).
+    Returns count deleted.
+    """
+    chat_id = TELEGRAM_INBOX_CHAT_ID
+    if not chat_id:
+        return 0
+    store = _load_notif_store()
+    now = time.time()
+    to_delete = []
+    to_keep = {}
+    for mid_str, sent_at in store.items():
+        age = now - sent_at
+        if max_age is None or age >= max_age:
+            to_delete.append(int(mid_str))
+        else:
+            to_keep[mid_str] = sent_at
+
+    deleted = 0
+    for mid in to_delete:
+        if delete_message(chat_id, mid):
+            deleted += 1
+    _save_notif_store(to_keep)
+    if deleted:
+        logger.info("Notification cleanup: deleted %d messages (max_age=%s)", deleted, max_age)
+    return deleted
 
 
 def _api_call(method: str, params: dict, timeout: int = 15) -> dict | None:
@@ -77,6 +137,15 @@ def edit_message(chat_id: str, message_id: int, text: str) -> None:
     })
 
 
+def delete_message(chat_id: str, message_id: int) -> bool:
+    """Delete a message from chat."""
+    result = _api_call("deleteMessage", {
+        "chat_id": chat_id,
+        "message_id": message_id,
+    })
+    return bool(result and result.get("ok"))
+
+
 def _content_type_icon(content_type: str) -> str:
     """Map content type to emoji."""
     return {
@@ -104,6 +173,7 @@ def send_approval(
     suggested_folder: str = "",
     new_type_label: str = "",
     new_type_reason: str = "",
+    filename: str = "",
 ) -> int | None:
     """Send approval message with inline buttons to inbox topic."""
     tags_str = ", ".join(html.escape(t) for t in tags) if tags else "—"
@@ -119,6 +189,12 @@ def send_approval(
     else:
         type_label = f"📝 {note_type} ({type_ru})"
 
+    # GitHub link to read the note
+    github_link = ""
+    if filename:
+        encoded = urllib.parse.quote(f"_inbox/{filename}")
+        github_link = f'\n🔗 <a href="{VAULT_GITHUB_URL}/{encoded}">Читать</a>'
+
     if needs_folder and suggested_folder:
         # --- No matching folder: propose new domain ---
         esc_suggested = html.escape(suggested_folder)
@@ -127,7 +203,7 @@ def send_approval(
             f"⚠️ Нет подходящей папки\n"
             f"💡 Предлагаю: <code>{esc_suggested}</code>\n"
             f"🏷 {tags_str}\n"
-            f"{type_label}"
+            f"{type_label}{github_link}"
         )
         if confidence:
             text += f"\n📊 {confidence:.0%}"
@@ -146,7 +222,7 @@ def send_approval(
             f"{icon} <b>{esc_title}</b>\n\n"
             f"📁 {esc_folder}\n"
             f"🏷 {tags_str}\n"
-            f"{type_label}"
+            f"{type_label}{github_link}"
         )
         if confidence:
             text += f"\n📊 {confidence:.0%}"
@@ -176,12 +252,46 @@ def notify_dm(text: str) -> int | None:
 
 
 def notify_inbox(text: str) -> int | None:
-    """Send to inbox forum topic."""
-    return send_message(
+    """Send system notification to inbox topic with ✓ Прочитано button."""
+    keyboard = {
+        "inline_keyboard": [[
+            {"text": "✓ Прочитано", "callback_data": "d:dismiss"},
+        ]]
+    }
+    mid = send_message(
         text,
         chat_id=TELEGRAM_INBOX_CHAT_ID,
         thread_id=TELEGRAM_INBOX_THREAD_ID,
+        reply_markup=keyboard,
     )
+    _track_notif(mid)
+    return mid
+
+
+def notify_orphans(orphans: list[str]) -> int | None:
+    """Send orphan docs notification with action buttons."""
+    paths_str = "\n".join(f"• {p}" for p in orphans[:10])
+    if len(orphans) > 10:
+        paths_str += f"\n…ещё {len(orphans) - 10}"
+    text = (
+        f"🔍 <b>Сироты в графе: {len(orphans)}</b>\n"
+        f"Файлы отсутствуют в vault, но есть в графе:\n"
+        f"<code>{paths_str}</code>"
+    )
+    keyboard = {
+        "inline_keyboard": [[
+            {"text": "🗑 Удалить всё", "callback_data": "o:delete"},
+            {"text": "⏭ Пропустить", "callback_data": "d:dismiss"},
+        ]]
+    }
+    mid = send_message(
+        text,
+        chat_id=TELEGRAM_INBOX_CHAT_ID,
+        thread_id=TELEGRAM_INBOX_THREAD_ID,
+        reply_markup=keyboard,
+    )
+    _track_notif(mid)
+    return mid
 
 
 def poll_callbacks(handler, poll_interval: float = 2.0) -> None:
@@ -203,13 +313,18 @@ def poll_callbacks(handler, poll_interval: float = 2.0) -> None:
                 time.sleep(poll_interval)
                 continue
 
-            for update in result.get("result", []):
+            updates = result.get("result", [])
+            if updates:
+                logger.info("Received %d callback updates", len(updates))
+
+            for update in updates:
                 offset = update["update_id"] + 1
                 cq = update.get("callback_query")
                 if not cq:
                     continue
 
                 data = cq.get("data", "")
+                logger.info("Callback data: %s", data)
                 if ":" not in data:
                     continue
 
