@@ -21,6 +21,7 @@ from .linker import (
 )
 from .telegram import notify_inbox
 from .approval import submit_for_approval, APPROVAL_MODE
+from .codebase_sync import maybe_sync_codebase_info
 
 logger = logging.getLogger(__name__)
 
@@ -332,6 +333,12 @@ def process_file(file_path: str, source: str = "unknown") -> list[str]:
 
 def _process_session(raw_text: str, inbox_path: Path) -> list[str]:
     """Extract multiple knowledge units from a session/compact transcript."""
+    # Sync codebase-info note for the repo referenced in this session (local only).
+    try:
+        maybe_sync_codebase_info(raw_text, VAULT_PATH)
+    except Exception as e:
+        logger.warning("codebase_sync failed (non-fatal): %s", e)
+
     units = extract_knowledge(raw_text)
     if not units:
         logger.info(f"No knowledge units in session: {inbox_path}")
