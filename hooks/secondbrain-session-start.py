@@ -10,7 +10,7 @@ import json
 import os
 from pathlib import Path
 
-MAX_NOTES = 50
+MAX_NOTES = int(os.environ.get("SB_MAX_NOTES", "50"))
 
 
 def main():

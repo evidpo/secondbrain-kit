@@ -8,6 +8,7 @@ Usage:
 
 import asyncio
 import json
+import logging
 import os
 import sys
 
@@ -16,8 +17,12 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
+logger = logging.getLogger(__name__)
+
 API_URL = os.getenv("SECONDBRAIN_API_URL", "https://memory.atom8.site")
 API_KEY = os.getenv("SECONDBRAIN_API_KEY", "")
+_MAX_RETRIES = 2
+_RETRY_DELAY = 2.0
 
 server = Server("secondbrain")
 _client: httpx.AsyncClient | None = None
@@ -32,6 +37,28 @@ def _get_client() -> httpx.AsyncClient:
             timeout=120.0,
         )
     return _client
+
+
+async def _api_call(method: str, path: str, **kwargs) -> httpx.Response:
+    """HTTP call with retry on 5xx and connection errors."""
+    client = _get_client()
+    last_exc = None
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            if method == "GET":
+                resp = await client.get(path, **kwargs)
+            else:
+                resp = await client.post(path, **kwargs)
+            if resp.status_code < 500:
+                return resp
+            last_exc = httpx.HTTPStatusError(
+                f"Server error: {resp.status_code}", request=resp.request, response=resp)
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
+            last_exc = e
+        if attempt < _MAX_RETRIES:
+            await asyncio.sleep(_RETRY_DELAY * (attempt + 1))
+            logger.warning("MCP retry %d/%d for %s %s", attempt + 1, _MAX_RETRIES, method, path)
+    raise last_exc
 
 
 @server.list_tools()
@@ -107,52 +134,68 @@ async def list_tools():
 
 @server.call_tool()
 async def handle_call_tool(name: str, arguments: dict):
-    client = _get_client()
+    try:
+        if name == "remember":
+            text = arguments["text"]
+            source = arguments.get("source", "mcp")
+            resp = await _api_call("POST", "/add", json={"text": text, "source": source})
+            if resp.status_code == 200:
+                data = resp.json()
+                return [TextContent(type="text", text=f"Saved to SecondBrain: {data.get('path', 'ok')}")]
+            elif resp.status_code == 422:
+                detail = "quality gate"
+                try:
+                    detail = resp.json().get("detail", detail)
+                except Exception:
+                    pass
+                return [TextContent(type="text", text=f"Rejected: {detail}")]
+            return [TextContent(type="text", text=f"Error: {resp.status_code} {resp.text}")]
 
-    if name == "remember":
-        text = arguments["text"]
-        source = arguments.get("source", "mcp")
-        resp = await client.post("/add", json={"text": text, "source": source})
-        if resp.status_code == 200:
-            data = resp.json()
-            return [TextContent(type="text", text=f"Saved to SecondBrain: {data.get('path', 'ok')}")]
-        elif resp.status_code == 422:
-            return [TextContent(type="text", text=f"Rejected: {resp.json().get('detail', 'quality gate')}")]
-        return [TextContent(type="text", text=f"Error: {resp.status_code} {resp.text}")]
+        elif name == "recall":
+            query = arguments["query"]
+            mode = arguments.get("mode", "mix")
+            resp = await _api_call("POST", "/search", json={"query": query, "mode": mode})
+            if resp.status_code == 200:
+                data = resp.json()
+                context = data.get("context", "")
+                if isinstance(context, dict):
+                    context = json.dumps(context, ensure_ascii=False, indent=2)
+                return [TextContent(type="text", text=str(context) or "No results found.")]
+            return [TextContent(type="text", text=f"Error: {resp.status_code}")]
 
-    elif name == "recall":
-        query = arguments["query"]
-        mode = arguments.get("mode", "mix")
-        resp = await client.post("/search", json={"query": query, "mode": mode})
-        if resp.status_code == 200:
-            data = resp.json()
-            context = data.get("context", "")
-            if isinstance(context, dict):
-                context = json.dumps(context, ensure_ascii=False, indent=2)
-            return [TextContent(type="text", text=str(context) or "No results found.")]
-        return [TextContent(type="text", text=f"Error: {resp.status_code}")]
+        elif name == "ask":
+            question = arguments["question"]
+            resp = await _api_call("POST", "/ask", json={"question": question})
+            if resp.status_code == 200:
+                data = resp.json()
+                answer = data.get("answer", "No answer.")
+                sources = data.get("sources", [])
+                if sources:
+                    answer += "\n\nSources: " + ", ".join(str(s) for s in sources[:5])
+                return [TextContent(type="text", text=answer)]
+            return [TextContent(type="text", text=f"Error: {resp.status_code}")]
 
-    elif name == "ask":
-        question = arguments["question"]
-        resp = await client.post("/ask", json={"question": question})
-        if resp.status_code == 200:
-            data = resp.json()
-            return [TextContent(type="text", text=data.get("answer", "No answer."))]
-        return [TextContent(type="text", text=f"Error: {resp.status_code}")]
+        elif name == "brain_stats":
+            resp = await _api_call("GET", "/stats")
+            if resp.status_code == 200:
+                data = resp.json()
+                lines = [
+                    f"Notes: {data.get('total_notes', '?')}",
+                    f"Entities: {data.get('entities', '?')}",
+                    f"Relations: {data.get('relations', '?')}",
+                ]
+                by_type = data.get("notes_by_type")
+                if by_type and isinstance(by_type, dict):
+                    lines.append("By type: " + ", ".join(f"{k}={v}" for k, v in by_type.items()))
+                return [TextContent(type="text", text=", ".join(lines))]
+            return [TextContent(type="text", text=f"Error: {resp.status_code}")]
 
-    elif name == "brain_stats":
-        resp = await client.get("/stats")
-        if resp.status_code == 200:
-            data = resp.json()
-            return [TextContent(type="text", text=(
-                f"Notes: {data['total_notes']}, "
-                f"Entities: {data['entities']}, "
-                f"Relations: {data['relations']}, "
-                f"Storage: {data['vector_storage']}"
-            ))]
-        return [TextContent(type="text", text=f"Error: {resp.status_code}")]
+        raise ValueError(f"Unknown tool: {name}")
 
-    raise ValueError(f"Unknown tool: {name}")
+    except (httpx.ConnectError, httpx.TimeoutException) as e:
+        return [TextContent(type="text", text=f"Engine unavailable (retries exhausted): {e}")]
+    except Exception as e:
+        return [TextContent(type="text", text=f"Error: {e}")]
 
 
 async def main():

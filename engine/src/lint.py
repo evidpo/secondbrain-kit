@@ -1,5 +1,6 @@
 """Vault / LightRAG integrity checks with optional auto-heal."""
 
+import json
 import logging
 import os
 import re
@@ -11,6 +12,7 @@ from .lightrag_engine import (
     compute_doc_id,
     strip_frontmatter,
     get_indexed_doc_ids,
+    get_indexed_paths,
     insert as lightrag_insert,
     delete_doc,
 )
@@ -20,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 VAULT_PATH = os.getenv("VAULT_PATH", "/app/vault")
 INBOX_DIR_NAME = os.getenv("INBOX_DIR_NAME", "_inbox")
-_SKIP_DIRS = {"templates", ".obsidian", ".git", ".lightrag", ".entire", ".trash"}
+_SKIP_DIRS = {"templates", ".obsidian", ".git", ".lightrag", ".entire", ".trash", "_system"}
 
 
 # ---------------------------------------------------------------------------
@@ -107,14 +109,36 @@ def check_dead_links(
     vault_path: str,
     fix: bool = False,
 ) -> dict:
-    """Links pointing to notes that don't exist in the vault."""
-    title_set = {n["title"].lower() for n in vault_notes.values() if n.get("title")}
-    dead: list[dict] = []
+    """Links pointing to notes that don't exist in the vault.
 
+    Resolves links by three strategies (Obsidian-compatible):
+    1. Title match: [[Профиль здоровья]] → note with that title
+    2. Path-qualified: [[health/profile]] → health/profile.md exists
+    3. Stem-only: [[profile]] → any */profile.md exists
+    4. Relative path: [[../goals]] → normalized to [[goals]] then stem match
+    """
+    title_set = {n["title"].lower() for n in vault_notes.values() if n.get("title")}
+    # "health/profile" from "health/profile.md"
+    path_qualified = {rel[:-3].lower() for rel in vault_notes}
+    # "profile" from any */profile.md
+    stem_set = {Path(rel).stem.lower() for rel in vault_notes}
+
+    dead: list[dict] = []
     for src, links in all_links.items():
         for link in links:
-            if link["base_title"] and link["base_title"].lower() not in title_set:
-                dead.append({"source": src, "target": link["base_title"]})
+            base = link["base_title"]
+            if not base:
+                continue
+            base_lower = base.lower()
+            # Normalize relative paths: "../goals" → "goals", "./goals" → "goals"
+            normalized = re.sub(r"^\.\.?/", "", base_lower)
+            if (
+                base_lower not in title_set
+                and base_lower not in path_qualified
+                and normalized not in stem_set
+                and normalized not in path_qualified
+            ):
+                dead.append({"source": src, "target": base})
 
     fixed = 0
     if fix and dead:
@@ -138,7 +162,12 @@ def check_orphan_notes(
     vault_notes: dict[str, dict],
     all_links: dict[str, list[dict]],
 ) -> dict:
-    """Notes with 0 incoming links AND 0 outgoing links."""
+    """Notes with 0 incoming links AND 0 outgoing links.
+
+    Exempts notes with needs_review: true in frontmatter (per CLAUDE.md policy).
+    """
+    import yaml as _yaml
+
     # Build incoming map: title_lower -> set of source rel_paths
     incoming: dict[str, set] = {}
     for src, links in all_links.items():
@@ -146,13 +175,12 @@ def check_orphan_notes(
             t = link["base_title"].lower()
             incoming.setdefault(t, set()).add(src)
 
-    # Notes with outgoing links
     has_outgoing = set(all_links.keys())
-
-    # Structural folders to exclude
     structural_prefixes = ("templates/", "goals/")
 
     orphans: list[dict] = []
+    exempt: list[dict] = []
+
     for rel, note in vault_notes.items():
         if rel.startswith(structural_prefixes):
             continue
@@ -160,9 +188,30 @@ def check_orphan_notes(
         has_in = title_lower in incoming
         has_out = rel in has_outgoing
         if not has_in and not has_out:
-            orphans.append({"path": rel, "title": note.get("title", "")})
+            # Check if note has needs_review: true (exempt orphan)
+            is_exempt = False
+            raw = note.get("content", "")
+            if raw.startswith("---"):
+                end = raw.find("---", 3)
+                if end != -1:
+                    try:
+                        meta = _yaml.safe_load(raw[3:end])
+                        if isinstance(meta, dict) and meta.get("needs_review"):
+                            is_exempt = True
+                    except Exception:
+                        pass
+            entry = {"path": rel, "title": note.get("title", "")}
+            if is_exempt:
+                exempt.append(entry)
+            else:
+                orphans.append(entry)
 
-    return {"count": len(orphans), "details": orphans}
+    return {
+        "count": len(orphans),
+        "details": orphans,
+        "exempt_count": len(exempt),
+        "exempt_details": exempt,
+    }
 
 
 def _fix_orphan_notes(orphans: list[dict], vault_path: str) -> int:
@@ -175,19 +224,26 @@ def _fix_orphan_notes(orphans: list[dict], vault_path: str) -> int:
 # ---------------------------------------------------------------------------
 
 def check_lightrag_orphans(vault_notes: dict[str, dict], fix: bool = False) -> dict:
-    """Docs in LightRAG index not matching any vault note doc_id."""
-    vault_doc_ids = {n["doc_id"] for n in vault_notes.values() if n.get("doc_id")}
-    indexed = get_indexed_doc_ids()
+    """Docs in LightRAG index whose file_path no longer exists in the vault.
 
-    orphans = [did for did in indexed if did not in vault_doc_ids]
+    Uses file_path matching (not content hash) so file edits don't create
+    false orphan reports.
+    """
+    vault_paths = set(vault_notes.keys())
+    indexed_paths = get_indexed_paths()  # {file_path: doc_id}
+
+    orphan_doc_ids = [
+        doc_id for fp, doc_id in indexed_paths.items()
+        if fp not in vault_paths
+    ]
 
     fixed = 0
     if fix:
-        for did in orphans:
+        for did in orphan_doc_ids:
             if delete_doc(did):
                 fixed += 1
 
-    return {"count": len(orphans), "details": orphans, "fixed": fixed}
+    return {"count": len(orphan_doc_ids), "details": orphan_doc_ids, "fixed": fixed}
 
 
 # ---------------------------------------------------------------------------
@@ -195,13 +251,16 @@ def check_lightrag_orphans(vault_notes: dict[str, dict], fix: bool = False) -> d
 # ---------------------------------------------------------------------------
 
 def check_vault_orphans(vault_notes: dict[str, dict], fix: bool = False) -> dict:
-    """Vault notes with valid body whose doc_id is NOT in LightRAG index."""
-    indexed = get_indexed_doc_ids()
-    indexed_ids = set(indexed.keys())
+    """Vault notes not indexed in LightRAG (by file_path, not content hash).
+
+    Content-hash matching breaks whenever a file is edited (e.g. daemon adds
+    wiki-links). File_path matching is stable across edits.
+    """
+    indexed_paths = get_indexed_paths()  # {file_path: doc_id}
 
     orphans: list[dict] = []
     for rel, note in vault_notes.items():
-        if note.get("doc_id") and note["doc_id"] not in indexed_ids:
+        if note.get("doc_id") and rel not in indexed_paths:
             orphans.append({"path": rel, "title": note.get("title", ""), "doc_id": note["doc_id"]})
 
     fixed = 0
@@ -290,7 +349,11 @@ def check_stale_anchors(
 # ---------------------------------------------------------------------------
 
 def check_title_path_mismatch(vault_notes: dict[str, dict]) -> dict:
-    """Slugified title doesn't match filename stem."""
+    """Slugified title doesn't match filename stem.
+
+    Skips by design: English filename stem (ASCII) + Russian/non-ASCII title.
+    Per CLAUDE.md rule: "Filenames: kebab-case, English. Title in frontmatter, not filename."
+    """
     mismatches: list[dict] = []
     for rel, note in vault_notes.items():
         title = note.get("title", "")
@@ -298,8 +361,12 @@ def check_title_path_mismatch(vault_notes: dict[str, dict]) -> dict:
             continue
         stem = Path(rel).stem
         title_slug = _slugify(title)
-        if title_slug and stem != title_slug:
-            mismatches.append({"path": rel, "title": title, "slug": title_slug, "stem": stem})
+        if not title_slug or stem == title_slug:
+            continue
+        # By design: English stem + non-ASCII (Russian) slug → skip
+        if stem.replace("-", "").replace("_", "").isascii() and not title_slug.replace("-", "").isascii():
+            continue
+        mismatches.append({"path": rel, "title": title, "slug": title_slug, "stem": stem})
 
     return {"count": len(mismatches), "details": mismatches}
 
@@ -318,6 +385,108 @@ def check_unlinked_entities() -> dict:
         return {"count": 0, "details": [], "note": "graph inspection not available in current mode"}
     except Exception:
         return {"count": 0, "details": [], "note": "LightRAG not available"}
+
+
+# ---------------------------------------------------------------------------
+# CHECK 8: Missing definitions (warnings only, does not affect total_issues)
+# ---------------------------------------------------------------------------
+
+def _load_definition_titles_lint(vault_path: str) -> list[tuple[str, list[str]]]:
+    """Return (title, aliases) pairs from knowledge/definitions/*.md."""
+    defs_dir = Path(vault_path) / "knowledge" / "definitions"
+    if not defs_dir.exists():
+        return []
+    result = []
+    for md_file in defs_dir.glob("*.md"):
+        text = md_file.read_text("utf-8")
+        fm = re.match(r"^---\s*\n(.*?)\n---", text, re.DOTALL)
+        if not fm:
+            continue
+        body = fm.group(1)
+        title_m = re.search(r'^title:\s*["\']?(.+?)["\']?\s*$', body, re.MULTILINE)
+        if not title_m:
+            continue
+        title = title_m.group(1).strip()
+        aliases_m = re.search(r'^aliases:\s*\[(.+?)\]', body, re.MULTILINE)
+        aliases = []
+        if aliases_m:
+            aliases = [a.strip().strip('"\'') for a in aliases_m.group(1).split(",")]
+        result.append((title, aliases))
+    return result
+
+
+def _entity_matches_def(name: str, defs: list[tuple[str, list[str]]]) -> bool:
+    name_lower = name.lower()
+    for title, aliases in defs:
+        if title.lower() == name_lower:
+            return True
+        if any(a.lower() == name_lower for a in aliases):
+            return True
+    return False
+
+
+def check_missing_definitions(vault_path: str | None = None) -> dict:
+    """Entities present in 3+ docs that have no knowledge/definitions/ file.
+
+    Returns warnings only — count is always 0 so it never contributes to
+    total_issues and never blocks the pipeline.
+    """
+    vp = vault_path or VAULT_PATH
+    from .lightrag_engine import _get_config
+    cfg = _get_config()
+    ec_file = Path(cfg["working_dir"]) / "kv_store_entity_chunks.json"
+    if not ec_file.exists():
+        return {"count": 0, "details": [], "warnings": [], "warnings_count": 0}
+
+    try:
+        entity_chunks = json.loads(ec_file.read_text("utf-8"))
+    except Exception:
+        return {"count": 0, "details": [], "warnings": [], "warnings_count": 0}
+
+    defs = _load_definition_titles_lint(vp)
+    warnings = []
+    for name, data in entity_chunks.items():
+        occurrences = len(data.get("chunk_ids", []))
+        if occurrences >= 3 and not _entity_matches_def(name, defs):
+            warnings.append({"entity": name, "occurrences": occurrences})
+
+    warnings.sort(key=lambda x: -x["occurrences"])
+    return {"count": 0, "details": [], "warnings": warnings, "warnings_count": len(warnings)}
+
+
+def check_duplicate_entities(vault_path: str | None = None, fix: bool = False) -> dict:
+    """Check for duplicate entity names in the LightRAG graph.
+
+    AUTO clusters (case variants, definition aliases, slug variants) are
+    counted as issues and fixed when fix=True. WARN clusters (fuzzy matches)
+    are always report-only.
+
+    Returns:
+        {
+          "count": int,        # number of AUTO clusters (0 after fix)
+          "details": [...],    # WARN clusters (always)
+          "fixed": int,        # AUTO clusters merged (only when fix=True)
+          "merged": [...],     # merge details
+        }
+    """
+    vp = vault_path or VAULT_PATH
+    try:
+        from .graph_dedup import run_dedup
+        result = run_dedup(vault_path=vp, dry_run=not fix)
+    except Exception as e:
+        logger.warning("check_duplicate_entities failed: %s", e)
+        return {"count": 0, "details": [], "fixed": 0, "merged": []}
+
+    auto_count = result.get("auto_clusters", 0)
+    merged = result.get("merged", [])
+    warn = result.get("warnings", [])
+
+    return {
+        "count": 0 if fix else auto_count,
+        "details": warn,
+        "fixed": len(merged) if fix else 0,
+        "merged": merged,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -369,8 +538,18 @@ def run_lint(vault_path: str | None = None, fix: bool = False) -> dict:
     r7 = check_unlinked_entities()
     results["unlinked_entities"] = r7
 
+    # CHECK 8: Missing definitions (warnings only, excluded from total_issues)
+    r8 = check_missing_definitions(vp)
+    results["missing_definitions"] = r8
+
+    # CHECK 9: Duplicate entities in graph (AUTO fixed when fix=True)
+    r9 = check_duplicate_entities(vault_path=vp, fix=fix)
+    results["duplicate_entities"] = r9
+    fixed_count += r9.get("fixed", 0)
+
     results["total_issues"] = sum(
-        r.get("count", 0) for k, r in results.items() if isinstance(r, dict) and "count" in r
+        r.get("count", 0) for k, r in results.items()
+        if isinstance(r, dict) and "count" in r and k not in ("missing_definitions",)
     )
     results["fixed"] = fixed_count
     return results

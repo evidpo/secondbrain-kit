@@ -15,6 +15,8 @@ import json
 import logging
 import os
 import re
+import tempfile
+import threading
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -26,6 +28,7 @@ CODE_LINE_THRESHOLD = 0.5  # reject if >50% lines look like code/logs
 
 _processed_hashes: set[str] = set()
 _HASH_FILE = os.path.join(VAULT_PATH, ".processed_hashes.json")
+_hash_lock = threading.Lock()
 
 # Patterns that indicate code/logs/junk
 _CODE_PATTERNS = re.compile(
@@ -42,7 +45,7 @@ _CODE_PATTERNS = re.compile(
 
 
 def _load_hashes() -> None:
-    """Load processed file hashes from disk."""
+    """Load processed file hashes from disk (caller must hold _hash_lock)."""
     global _processed_hashes
     try:
         path = Path(_HASH_FILE)
@@ -53,11 +56,25 @@ def _load_hashes() -> None:
 
 
 def _save_hashes() -> None:
-    """Persist processed file hashes to disk."""
+    """Persist processed file hashes to disk atomically (caller must hold _hash_lock)."""
     try:
         path = Path(_HASH_FILE)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(sorted(_processed_hashes)))
+        data = json.dumps(sorted(_processed_hashes))
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        closed = False
+        try:
+            os.write(fd, data.encode("utf-8"))
+            os.fsync(fd)
+            os.close(fd)
+            closed = True
+            os.replace(tmp, str(path))
+        except Exception:
+            if not closed:
+                os.close(fd)
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
     except Exception as e:
         logger.warning(f"Could not save hash file: {e}")
 
@@ -92,19 +109,21 @@ def _log_rejection(file_path: str, reason: str) -> None:
 
 def check_file_hash(text: str) -> tuple[bool, str]:
     """L1: File-level dedup. Returns (pass, reason)."""
-    if not _processed_hashes:
-        _load_hashes()
-    h = _hash_text(text)
-    if h in _processed_hashes:
-        return False, f"file_hash_duplicate:{h}"
+    with _hash_lock:
+        if not _processed_hashes:
+            _load_hashes()
+        h = _hash_text(text)
+        if h in _processed_hashes:
+            return False, f"file_hash_duplicate:{h}"
     return True, ""
 
 
 def mark_processed(text: str) -> None:
     """Mark file hash as processed after successful pipeline completion."""
-    h = _hash_text(text)
-    _processed_hashes.add(h)
-    _save_hashes()
+    with _hash_lock:
+        h = _hash_text(text)
+        _processed_hashes.add(h)
+        _save_hashes()
 
 
 def check_size(text: str) -> tuple[bool, str]:

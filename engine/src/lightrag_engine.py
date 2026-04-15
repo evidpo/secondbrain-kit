@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
@@ -17,6 +18,9 @@ logger = logging.getLogger(__name__)
 _instance: LightRAG | None = None
 _loop: asyncio.AbstractEventLoop | None = None
 _thread: threading.Thread | None = None
+_loop_lock = threading.Lock()
+
+_TIMEOUT = int(os.getenv("LIGHTRAG_TIMEOUT", "300"))
 
 
 def _get_config() -> dict:
@@ -34,25 +38,96 @@ def _get_config() -> dict:
 def _ensure_loop() -> asyncio.AbstractEventLoop:
     """Get or create a dedicated event loop running in a background thread."""
     global _loop, _thread
-    if _loop is not None and _loop.is_running():
+    with _loop_lock:
+        if _loop is not None and _loop.is_running():
+            return _loop
+
+        _loop = asyncio.new_event_loop()
+
+        def _run():
+            asyncio.set_event_loop(_loop)
+            _loop.run_forever()
+
+        _thread = threading.Thread(target=_run, daemon=True, name="lightrag-loop")
+        _thread.start()
         return _loop
 
-    _loop = asyncio.new_event_loop()
 
-    def _run():
-        asyncio.set_event_loop(_loop)
-        _loop.run_forever()
-
-    _thread = threading.Thread(target=_run, daemon=True, name="lightrag-loop")
-    _thread.start()
-    return _loop
-
-
-def _run_sync(coro):
+def _run_sync(coro, timeout: int | None = None):
     """Run an async coroutine synchronously using the background event loop."""
     loop = _ensure_loop()
     future = asyncio.run_coroutine_threadsafe(coro, loop)
-    return future.result(timeout=300)
+    return future.result(timeout=timeout or _TIMEOUT)
+
+
+def _retry_sync(coro_factory, retries: int = 3, base_delay: float = 2.0, label: str = ""):
+    """Retry a coroutine with exponential backoff.
+
+    coro_factory must be a callable that returns a NEW coroutine each call.
+    """
+    import time as _time
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        try:
+            return _run_sync(coro_factory())
+        except Exception as e:
+            last_exc = e
+            if attempt < retries:
+                delay = base_delay * (2 ** (attempt - 1))
+                logger.warning("Retry %d/%d for %s (delay=%.1fs): %s",
+                               attempt, retries, label or "operation", delay, e)
+                _time.sleep(delay)
+    raise last_exc
+
+
+def _load_definitions_context(vault_path: str) -> str:
+    """Read all knowledge/definitions/*.md and build a canonical entity hint string."""
+    defs_dir = Path(vault_path) / "knowledge" / "definitions"
+    if not defs_dir.exists():
+        return ""
+
+    lines = []
+    for md_file in sorted(defs_dir.glob("*.md")):
+        text = md_file.read_text("utf-8")
+        # Extract frontmatter block
+        fm_match = re.match(r"^---\s*\n(.*?)\n---", text, re.DOTALL)
+        if not fm_match:
+            continue
+        fm = fm_match.group(1)
+
+        title_match = re.search(r'^title:\s*["\']?(.+?)["\']?\s*$', fm, re.MULTILINE)
+        if not title_match:
+            continue
+        title = title_match.group(1).strip()
+
+        aliases_match = re.search(r'^aliases:\s*\[(.+?)\]', fm, re.MULTILINE)
+        if aliases_match:
+            raw = aliases_match.group(1)
+            aliases = [a.strip().strip('"\'') for a in raw.split(",")]
+            lines.append(f"- {title} (aliases: {', '.join(aliases)})")
+        else:
+            lines.append(f"- {title}")
+
+    if not lines:
+        return ""
+
+    header = "Known entities (use these exact names, do not create variations):"
+    return header + "\n" + "\n".join(lines)
+
+
+def _make_llm_with_context(base_func, context_str: str):
+    """Wrap gemini_model_complete to inject entity hints into extraction prompts."""
+    import functools
+
+    @functools.wraps(base_func)
+    async def wrapper(prompt, system_prompt=None, **kwargs):
+        if system_prompt and any(
+            kw in system_prompt.lower() for kw in ("entity", "named", "extract")
+        ):
+            system_prompt = f"{context_str}\n\n{system_prompt}"
+        return await base_func(prompt, system_prompt=system_prompt, **kwargs)
+
+    return wrapper
 
 
 async def _create_instance() -> LightRAG:
@@ -60,9 +135,17 @@ async def _create_instance() -> LightRAG:
     working_dir = cfg["working_dir"]
     Path(working_dir).mkdir(parents=True, exist_ok=True)
 
+    vault_path = os.getenv("VAULT_PATH", "")
+    ctx_str = _load_definitions_context(vault_path) if vault_path else ""
+    if ctx_str:
+        llm_func = _make_llm_with_context(gemini_model_complete, ctx_str)
+        logger.info("definitions_context loaded (%d entities)", ctx_str.count("\n- ") + 1)
+    else:
+        llm_func = gemini_model_complete
+
     rag = LightRAG(
         working_dir=working_dir,
-        llm_model_func=gemini_model_complete,
+        llm_model_func=llm_func,
         llm_model_name=cfg["llm_model"],
         embedding_func=EmbeddingFunc(
             embedding_dim=cfg["embedding_dim"],
@@ -75,6 +158,7 @@ async def _create_instance() -> LightRAG:
         vector_storage=cfg["vector_storage"],
         addon_params={
             "language": "Russian",
+            "entity_extraction_context": ctx_str,
         },
     )
     await rag.initialize_storages()
@@ -94,13 +178,58 @@ def get_instance() -> LightRAG:
     return _instance
 
 
+def _cleanup_failed_docs_for_path(rag: "LightRAG", file_path: str) -> int:
+    """Delete failed or dup- doc_status records for a given file path.
+
+    Prevents dup- prefix accumulation when a file is retried after a prior
+    failed insertion (e.g. LLM API was unavailable). Only removes records
+    with status 'failed'/'error' or doc_id starting with 'dup-'.
+    Successfully processed records are left untouched.
+
+    Returns: number of records deleted.
+    """
+    if not hasattr(rag.doc_status, "_data"):
+        return 0
+
+    to_delete = []
+    for doc_id, info in list(rag.doc_status._data.items()):
+        stored_path = getattr(info, "file_path", None) or (
+            info.get("file_path") if isinstance(info, dict) else None
+        )
+        status = getattr(info, "status", None) or (
+            info.get("status") if isinstance(info, dict) else None
+        )
+        if stored_path == file_path and (
+            doc_id.startswith("dup-") or str(status) in ("failed", "error")
+        ):
+            to_delete.append(doc_id)
+
+    deleted = 0
+    for doc_id in to_delete:
+        if delete_doc(doc_id):
+            deleted += 1
+            logger.info("Pre-insert cleanup: removed %s record for %s", doc_id[:20], file_path)
+
+    return deleted
+
+
 def insert(text: str, file_path: str | None = None) -> str | None:
-    """Insert a document into LightRAG. Returns track_id."""
+    """Insert a document into LightRAG with retry. Returns track_id."""
     rag = get_instance()
+
+    if file_path:
+        _cleanup_failed_docs_for_path(rag, file_path)
+
     kwargs = {}
     if file_path:
         kwargs["file_paths"] = [file_path]
-    track_id = _run_sync(rag.ainsert(text, **kwargs))
+
+    track_id = _retry_sync(
+        lambda: rag.ainsert(text, **kwargs),
+        retries=3,
+        base_delay=2.0,
+        label=f"insert({file_path or text[:40]})",
+    )
     logger.info("Inserted document: %s (track=%s)", file_path or text[:60], track_id)
     return track_id
 
@@ -136,16 +265,31 @@ def stats() -> dict:
 
 
 def find_similar(text: str, top_k: int = 3) -> list[dict]:
-    """Search for similar content in the knowledge graph. Returns list of {content, score}."""
+    """Search for similar content in the knowledge graph.
+
+    Returns list of {content, source, score} where score is a proxy metric
+    based on content overlap (0.0-1.0). LightRAG doesn't expose raw cosine
+    scores, so we estimate relevance from content length and overlap.
+    """
+    from difflib import SequenceMatcher
+
     try:
         data = query_data(text, mode="mix", top_k=top_k)
+        results = []
         if isinstance(data, dict):
             chunks = data.get("chunks", [])
-            if chunks:
-                return [{"content": c.get("content", ""), "source": c.get("file_path", "")}
-                        for c in chunks if isinstance(c, dict)]
-        if isinstance(data, str) and data.strip():
-            return [{"content": data[:500], "source": "graph_context"}]
+            for c in chunks:
+                if not isinstance(c, dict):
+                    continue
+                content = c.get("content", "")
+                source = c.get("file_path", "")
+                # Proxy score: sequence similarity between query and result
+                score = SequenceMatcher(None, text[:500].lower(), content[:500].lower()).ratio()
+                results.append({"content": content, "source": source, "score": round(score, 3)})
+        if not results and isinstance(data, str) and data.strip():
+            score = SequenceMatcher(None, text[:500].lower(), data[:500].lower()).ratio()
+            results.append({"content": data[:500], "source": "graph_context", "score": round(score, 3)})
+        return results
     except Exception as e:
         logger.warning("Similarity search failed: %s", e)
     return []
@@ -187,6 +331,30 @@ def get_indexed_doc_ids() -> dict[str, str]:
         return docs
     except Exception as e:
         logger.warning("Failed to get indexed docs: %s", e)
+        return {}
+
+
+def get_indexed_paths() -> dict[str, str]:
+    """Get all indexed file paths and their doc_ids.
+
+    More reliable than get_indexed_doc_ids() for orphan detection because
+    file_path doesn't change when file content changes (unlike content hash).
+
+    Returns: {file_path: doc_id}
+    """
+    rag = get_instance()
+    try:
+        paths: dict[str, str] = {}
+        if hasattr(rag.doc_status, "_data"):
+            for doc_id, info in rag.doc_status._data.items():
+                stored_path = getattr(info, "file_path", None) or (
+                    info.get("file_path") if isinstance(info, dict) else None
+                )
+                if stored_path:
+                    paths[stored_path] = doc_id
+        return paths
+    except Exception as e:
+        logger.warning("Failed to get indexed paths: %s", e)
         return {}
 
 
@@ -235,48 +403,99 @@ def compute_doc_id(content: str) -> str:
     return f"doc-{hashlib.md5(body.encode()).hexdigest()}"
 
 
-def sync_with_vault(vault_path: str, skip_dirs: set[str] | None = None) -> dict:
+def get_related_docs_from_graph(file_path: str, working_dir: str, limit: int = 5) -> list[str]:
+    """Find documents related to a given file via shared LightRAG entities.
+
+    Uses local KV store files — no LLM/embedding calls required.
+    Returns list of relative file paths (e.g. 'knowledge/definitions/законы-логики.md').
+    """
+    try:
+        wdir = Path(working_dir)
+        ec_file = wdir / "kv_store_entity_chunks.json"
+        tc_file = wdir / "kv_store_text_chunks.json"
+        if not ec_file.exists() or not tc_file.exists():
+            return []
+
+        entity_chunks = json.loads(ec_file.read_text("utf-8"))
+        text_chunks = json.loads(tc_file.read_text("utf-8"))
+
+        # Build: chunk_id → file_path
+        chunk_to_doc: dict[str, str] = {}
+        for chunk_id, info in text_chunks.items():
+            fp = info.get("file_path") if isinstance(info, dict) else None
+            if fp:
+                chunk_to_doc[chunk_id] = fp
+
+        # Build: entity_name → set(file_paths)
+        entity_to_docs: dict[str, set[str]] = {}
+        for entity_name, data in entity_chunks.items():
+            chunk_ids = data.get("chunk_ids", []) if isinstance(data, dict) else []
+            docs = {chunk_to_doc[cid] for cid in chunk_ids if cid in chunk_to_doc}
+            if docs:
+                entity_to_docs[entity_name] = docs
+
+        # Find entities in this document
+        doc_entities = {e for e, docs in entity_to_docs.items() if file_path in docs}
+        if not doc_entities:
+            return []
+
+        # Count shared entities per related document
+        related: dict[str, int] = {}
+        for entity in doc_entities:
+            for other_doc in entity_to_docs.get(entity, set()):
+                if other_doc != file_path:
+                    related[other_doc] = related.get(other_doc, 0) + 1
+
+        # Sort by number of shared entities
+        return [doc for doc, _ in sorted(related.items(), key=lambda x: -x[1])[:limit]]
+
+    except Exception as e:
+        logger.warning("get_related_docs_from_graph failed for %s: %s", file_path, e)
+        return []
+
+
+def sync_with_vault(vault_path: str, skip_dirs: set[str] | None = None,
+                    dry_run: bool = False) -> dict:
     """Sync LightRAG graph with actual vault files.
 
-    Deletes docs from graph that no longer exist in vault.
-    Hashes content WITHOUT frontmatter (same as reindex script).
-    Returns: {deleted: [doc_ids], kept: int}
+    By default (dry_run=True in watcher): returns orphans WITHOUT deleting.
+    With dry_run=False: actually deletes orphan docs (use only from API /reindex-sync).
+    Returns: {deleted: [doc_ids], orphans: [paths], kept: int}
     """
     vault = Path(vault_path)
     if skip_dirs is None:
         skip_dirs = {"templates", ".obsidian", ".git", ".lightrag", ".entire", ".trash"}
     inbox = os.getenv("INBOX_DIR_NAME", "_inbox")
 
-    # Collect hashes of vault file bodies (stripped of frontmatter)
-    vault_hashes = set()
+    # Collect relative paths of all vault files
+    vault_paths: set[str] = set()
     for d in vault.iterdir():
         if not d.is_dir() or d.name in skip_dirs or d.name.startswith(".") or d.name == inbox:
             continue
         for f in d.rglob("*.md"):
-            try:
-                raw = f.read_text(encoding="utf-8").strip()
-                body = strip_frontmatter(raw)
-                if body and len(body) >= 20:
-                    vault_hashes.add(compute_doc_id(raw))
-            except Exception:
-                continue
+            if not f.name.startswith("."):
+                vault_paths.add(str(f.relative_to(vault)))
 
-    # Compare with indexed docs
-    indexed = get_indexed_doc_ids()
-    if not indexed:
-        return {"deleted": [], "kept": 0}
+    # Compare by file_path (not content hash) — robust to file edits
+    indexed_paths = get_indexed_paths()  # {file_path: doc_id}
+    if not indexed_paths:
+        return {"deleted": [], "orphans": [], "kept": 0}
+
+    orphan_items = [(fp, did) for fp, did in indexed_paths.items() if fp not in vault_paths]
+    orphan_ids = [did for _, did in orphan_items]
+    orphan_paths = [fp for fp, _ in orphan_items]
 
     deleted = []
-    for doc_id in indexed:
-        if doc_id not in vault_hashes:
+    if not dry_run:
+        for doc_id in orphan_ids:
             if delete_doc(doc_id):
                 deleted.append(doc_id)
-                logger.info("Sync: removed orphan doc %s (%s)", doc_id, indexed[doc_id])
+                logger.info("Sync: removed orphan doc %s", doc_id)
+        if deleted:
+            logger.info("Vault sync: deleted %d orphan docs, kept %d",
+                        len(deleted), len(indexed_paths) - len(deleted))
 
-    result = {"deleted": deleted, "kept": len(indexed) - len(deleted)}
-    if deleted:
-        logger.info("Vault sync: deleted %d orphan docs, kept %d", len(deleted), result["kept"])
-    return result
+    return {"deleted": deleted, "orphans": orphan_paths, "kept": len(indexed_paths) - len(orphan_ids)}
 
 
 def shutdown():

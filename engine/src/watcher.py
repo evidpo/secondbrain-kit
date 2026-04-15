@@ -47,6 +47,9 @@ REINDEX_CHANGE_THRESHOLD = int(os.getenv("REINDEX_CHANGE_THRESHOLD", "20"))  # a
 STALE_CHECK_INTERVAL = 3600  # 1 hour — check for stale approvals
 DAILY_CLEANUP_INTERVAL = 86400  # 24 hours — purge accumulated system notifications
 
+# Thread coordination: startup reindex must finish before threshold reindex
+_startup_done = threading.Event()
+
 
 class InboxHandler(FileSystemEventHandler):
     """Handle new .md files in Inbox."""
@@ -337,6 +340,8 @@ def start_watcher() -> None:
             logger.info("_index.md updated")
         except Exception as e:
             logger.warning("Index write failed: %s", e)
+        finally:
+            _startup_done.set()
 
     threading.Thread(target=_startup_reindex, daemon=True, name="startup-reindex").start()
 
@@ -377,7 +382,8 @@ def start_watcher() -> None:
                 )
 
             # Threshold-based reindex: when enough changes accumulate
-            if change_counter >= REINDEX_CHANGE_THRESHOLD:
+            # Wait for startup reindex to finish first to avoid overlapping operations
+            if change_counter >= REINDEX_CHANGE_THRESHOLD and _startup_done.is_set():
                 logger.info("Change threshold reached (%d), triggering reindex", change_counter)
                 change_counter = 0
                 def _threshold_reindex():

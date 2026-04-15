@@ -6,6 +6,7 @@ See docs/PRINCIPLES.md for architectural invariants.
 import logging
 import os
 import re
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +44,25 @@ _SKIP_DIRS = {"templates", ".obsidian", ".git", ".lightrag", ".entire", ".trash"
 
 # Similarity threshold for merging (S1: uniqueness principle)
 MERGE_THRESHOLD = float(os.getenv("MERGE_THRESHOLD", "0.85"))
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    """Write content to file atomically via tempfile + os.replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    closed = False
+    try:
+        os.write(fd, content.encode("utf-8"))
+        os.fsync(fd)
+        os.close(fd)
+        closed = True
+        os.replace(tmp, str(path))
+    except Exception:
+        if not closed:
+            os.close(fd)
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 def _list_vault_paths() -> list[str]:
@@ -162,19 +182,28 @@ def _check_semantic_duplicate(text: str) -> tuple[bool, str]:
     """L6: Check if similar content already exists in the graph.
 
     Returns (is_duplicate, existing_file_source).
+    Uses MERGE_THRESHOLD to decide: score >= threshold → duplicate.
     """
     similar = find_similar(text, top_k=1)
     if not similar:
         return False, ""
 
-    # Check if the returned context is substantial enough to indicate a real match
     top = similar[0]
     source = top.get("source", "")
     content = top.get("content", "")
+    score = top.get("score", 0.0)
 
-    # If we got meaningful content back, it's likely a semantic match
-    if content and len(content) > 50:
+    if not content or len(content) <= 50:
+        return False, ""
+
+    if score >= MERGE_THRESHOLD:
+        logger.info("Semantic duplicate (score=%.3f >= %.2f): %s",
+                     score, MERGE_THRESHOLD, source)
         return True, source
+
+    if score >= MERGE_THRESHOLD - 0.10:
+        logger.warning("Near-duplicate (score=%.3f, threshold=%.2f): %s — skipping merge",
+                        score, MERGE_THRESHOLD, source)
 
     return False, ""
 
@@ -249,7 +278,7 @@ def _inject_backlinks(source_title: str, target_titles: list[str]) -> int:
             # Append Links section at the end
             content = content.rstrip("\n") + f"\n\n## Links\n- [[{source_title}]]\n"
 
-        target_path.write_text(content, encoding="utf-8")
+        _atomic_write(target_path, content)
         logger.info("Backlink added: [[%s]] → %s", source_title, target_path.name)
         updated += 1
 
@@ -400,7 +429,7 @@ def _process_session(raw_text: str, inbox_path: Path) -> list[str]:
                 proposed_folder=proposed_folder,
             )
             target_path = vault / INBOX_DIR_NAME / filename
-            target_path.write_text(content, encoding="utf-8")
+            _atomic_write(target_path, content)
             logger.info(f"Session unit pending: {analysis['title']} → {proposed_folder or 'inbox'}")
 
             submit_for_approval(
@@ -421,7 +450,7 @@ def _process_session(raw_text: str, inbox_path: Path) -> list[str]:
         target_path = target_dir / filename
 
         content = _render_note(analysis, body, needs_review=needs_review)
-        target_path.write_text(content, encoding="utf-8")
+        _atomic_write(target_path, content)
         logger.info(f"Session unit: {target_path}")
 
         if needs_review:
@@ -466,7 +495,11 @@ def _merge_into_existing(new_text: str, existing_source: str, inbox_path: Path) 
     existing_body = _extract_body(existing_content)
 
     # LLM merge: combine existing + new, no duplication
-    merged_body = merge_notes(existing_body, new_text)
+    try:
+        merged_body = merge_notes(existing_body, new_text)
+    except Exception as e:
+        logger.error("LLM merge failed for %s: %s — leaving note in inbox", existing_source, e)
+        return []
 
     # Preserve original frontmatter, replace body
     if existing_content.startswith("---"):
@@ -485,7 +518,7 @@ def _merge_into_existing(new_text: str, existing_source: str, inbox_path: Path) 
     else:
         merged_content = f"{existing_content}\n\n{merged_body}\n"
 
-    existing_path.write_text(merged_content, encoding="utf-8")
+    _atomic_write(existing_path, merged_content)
     logger.info(f"Merged into existing: {existing_path}")
 
     # Update LightRAG with merged content
@@ -582,7 +615,7 @@ def _create_new_note(raw_text: str, inbox_path: Path, source: str = "unknown",
             proposed_folder=proposed_folder,
         )
         target_path = vault / INBOX_DIR_NAME / filename
-        target_path.write_text(content, encoding="utf-8")
+        _atomic_write(target_path, content)
         logger.info(f"Pending approval: {title} → {proposed_folder or 'inbox'}")
 
         submit_for_approval(
@@ -628,7 +661,7 @@ def _create_new_note(raw_text: str, inbox_path: Path, source: str = "unknown",
         needs_folder=needs_folder,
         proposed_folder=suggested_folder if needs_folder else "",
     )
-    target_path.write_text(content, encoding="utf-8")
+    _atomic_write(target_path, content)
     logger.info(f"Created: {target_path}" + (" [needs_review]" if needs_review else ""))
 
     if APPROVAL_MODE == "notify":

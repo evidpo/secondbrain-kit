@@ -14,8 +14,8 @@ from pathlib import Path
 VAULT_PATH = os.environ.get("VAULT_PATH", os.path.expanduser("~/SecondBrain"))
 INBOX_DIR_NAME = os.environ.get("INBOX_DIR_NAME", "_inbox")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_INBOX_CHAT_ID = os.environ.get("TELEGRAM_INBOX_CHAT_ID", "-1003599063509")
-TELEGRAM_INBOX_THREAD_ID = os.environ.get("TELEGRAM_INBOX_THREAD_ID", "2912")
+TELEGRAM_INBOX_CHAT_ID = os.environ.get("TELEGRAM_INBOX_CHAT_ID", "")
+TELEGRAM_INBOX_THREAD_ID = os.environ.get("TELEGRAM_INBOX_THREAD_ID", "")
 
 
 def count_needs_review() -> tuple[int, list[str]]:
@@ -46,6 +46,9 @@ def send_telegram(message: str) -> bool:
     """Send message to SecondBrain inbox topic."""
     if not TELEGRAM_BOT_TOKEN:
         print("ERROR: TELEGRAM_BOT_TOKEN not set", file=sys.stderr)
+        return False
+    if not TELEGRAM_INBOX_CHAT_ID:
+        print("ERROR: TELEGRAM_INBOX_CHAT_ID not set", file=sys.stderr)
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"

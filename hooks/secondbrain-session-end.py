@@ -107,7 +107,13 @@ Session: {session_id[:8]}
     inbox.mkdir(parents=True, exist_ok=True)
 
     filename = f"session-{date_str}-{session_id[:8]}.md"
-    (inbox / filename).write_text(note, encoding="utf-8")
+    target = inbox / filename
+    try:
+        target.write_text(note, encoding="utf-8")
+        if not target.exists() or target.stat().st_size == 0:
+            print(f"WARNING: session file written but empty: {target}", file=sys.stderr)
+    except Exception as e:
+        print(f"ERROR: failed to write session: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":

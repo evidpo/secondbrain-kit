@@ -108,7 +108,13 @@ Reason: pre-compact capture
     inbox.mkdir(parents=True, exist_ok=True)
 
     filename = f"compact-{date_str}-{session_id[:8]}.md"
-    (inbox / filename).write_text(note, encoding="utf-8")
+    target = inbox / filename
+    try:
+        target.write_text(note, encoding="utf-8")
+        if not target.exists() or target.stat().st_size == 0:
+            print(f"WARNING: compact file written but empty: {target}", file=sys.stderr)
+    except Exception as e:
+        print(f"ERROR: failed to write compact: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":

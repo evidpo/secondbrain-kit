@@ -1,10 +1,14 @@
 """Approval workflow: pending notes queue + Telegram callback handlers."""
 
+import fcntl
 import json
 import logging
 import os
+import re
 import shutil
+import tempfile
 import time
+from datetime import date
 from pathlib import Path
 
 from .telegram import (
@@ -35,15 +39,34 @@ class ApprovalQueue:
         try:
             p = Path(_QUEUE_FILE)
             if p.exists():
-                self._data = json.loads(p.read_text("utf-8"))
+                with open(p, "r", encoding="utf-8") as fh:
+                    fcntl.flock(fh, fcntl.LOCK_SH)
+                    try:
+                        self._data = json.load(fh)
+                    finally:
+                        fcntl.flock(fh, fcntl.LOCK_UN)
         except Exception:
             self._data = {}
 
     def _save(self):
         try:
-            Path(_QUEUE_FILE).write_text(
-                json.dumps(self._data, ensure_ascii=False, indent=2), "utf-8",
-            )
+            p = Path(_QUEUE_FILE)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            data = json.dumps(self._data, ensure_ascii=False, indent=2)
+            fd, tmp = tempfile.mkstemp(dir=str(p.parent), suffix=".tmp")
+            closed = False
+            try:
+                os.write(fd, data.encode("utf-8"))
+                os.fsync(fd)
+                os.close(fd)
+                closed = True
+                os.replace(tmp, str(p))
+            except Exception:
+                if not closed:
+                    os.close(fd)
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+                raise
         except Exception as e:
             logger.warning("Queue save failed: %s", e)
 
@@ -144,16 +167,40 @@ def _inject_backlinks_for_note(title: str, links: list[str]) -> None:
     """Inject backlinks into referenced vault notes after approval.
 
     Lazy import from processor to avoid circular dependency at module load.
+    Validates that link targets exist before injecting.
     """
     if not links:
         return
     try:
+        vault = Path(VAULT_PATH)
+        existing_titles = {
+            f.stem for d in vault.iterdir() if d.is_dir() and not d.name.startswith(".")
+            for f in d.rglob("*.md")
+        }
+        valid_links = [l for l in links if _slugify_simple(l) in existing_titles or
+                       any((vault / d / f"{_slugify_simple(l)}.md").exists()
+                           for d in os.listdir(VAULT_PATH)
+                           if (vault / d).is_dir() and not d.startswith("."))]
+        if not valid_links:
+            logger.info("No valid backlink targets found for '%s'", title)
+            return
+        dropped = len(links) - len(valid_links)
+        if dropped:
+            logger.info("Dropped %d dead backlink targets for '%s'", dropped, title)
         from .processor import _inject_backlinks
-        injected = _inject_backlinks(title, links)
+        injected = _inject_backlinks(title, valid_links)
         if injected:
             logger.info("Injected %d backlinks for '%s'", injected, title)
     except Exception as e:
         logger.warning("Backlink injection failed: %s", e)
+
+
+def _slugify_simple(text: str) -> str:
+    """Simple slugify for title → filename matching."""
+    import unicodedata
+    text = unicodedata.normalize("NFKD", text)
+    text = re.sub(r"[^\w\s-]", "", text.lower())
+    return re.sub(r"[-\s]+", "-", text).strip("-")
 
 
 def handle_callback(
@@ -224,6 +271,17 @@ def handle_callback(
                 content = target_path.read_text("utf-8")
                 lightrag_insert(content, file_path=rel_path)
                 logger.info("Approved + indexed: %s → %s", title, rel_path)
+                _create_definition_drafts(content, vault)
+                try:
+                    from .graph_dedup import run_dedup
+                    dedup = run_dedup(vault_path=str(vault), dry_run=False)
+                    if dedup.get("merged"):
+                        logger.info(
+                            "Entity dedup: merged %d cluster(s) after insert",
+                            len(dedup["merged"]),
+                        )
+                except Exception as dedup_err:
+                    logger.warning("Entity dedup (non-blocking): %s", dedup_err)
             except Exception as e:
                 logger.warning("LightRAG insert after approval failed: %s", e)
             _update_forward_links(target_path, existing_links)
@@ -345,6 +403,85 @@ def cleanup_stale() -> int:
         logger.info("Stale cleanup: resent %s", title)
 
     return refreshed
+
+
+def _load_definition_titles(vault: Path) -> list[tuple[str, list[str]]]:
+    """Return (title, aliases) pairs from knowledge/definitions/*.md frontmatter."""
+    defs_dir = vault / "knowledge" / "definitions"
+    if not defs_dir.exists():
+        return []
+    result = []
+    for md_file in defs_dir.glob("*.md"):
+        text = md_file.read_text("utf-8")
+        fm = re.match(r"^---\s*\n(.*?)\n---", text, re.DOTALL)
+        if not fm:
+            continue
+        body = fm.group(1)
+        title_m = re.search(r'^title:\s*["\']?(.+?)["\']?\s*$', body, re.MULTILINE)
+        if not title_m:
+            continue
+        title = title_m.group(1).strip()
+        aliases_m = re.search(r'^aliases:\s*\[(.+?)\]', body, re.MULTILINE)
+        aliases = []
+        if aliases_m:
+            aliases = [a.strip().strip('"\'') for a in aliases_m.group(1).split(",")]
+        result.append((title, aliases))
+    return result
+
+
+def _has_definition(term: str, defs: list[tuple[str, list[str]]]) -> bool:
+    """Return True if term matches any known definition title or alias."""
+    term_lower = term.lower()
+    for title, aliases in defs:
+        if title.lower() == term_lower:
+            return True
+        if any(a.lower() == term_lower for a in aliases):
+            return True
+    return False
+
+
+def _create_definition_drafts(content: str, vault: Path) -> None:
+    """Extract key terms from content and create _inbox/def-*.md drafts if undefined."""
+    try:
+        import google.generativeai as genai
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        prompt = (
+            "Выдели ключевые термины из текста, которые могут требовать отдельного файла "
+            "определения (концепции, имена собственные, фреймворки). "
+            "Верни только JSON-массив строк. Максимум 5 терминов. Только самые важные.\n\n"
+            f"{content[:3000]}"
+        )
+        response = model.generate_content(prompt)
+        raw = response.text.strip()
+        # Strip markdown code fences if present
+        raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("` \n")
+        terms = json.loads(raw)
+        if not isinstance(terms, list):
+            return
+    except Exception as e:
+        logger.warning("Definition term extraction failed: %s", e)
+        return
+
+    defs = _load_definition_titles(vault)
+    inbox = vault / INBOX_DIR_NAME
+    today = date.today().isoformat()
+
+    for term in terms:
+        if not isinstance(term, str) or not term.strip():
+            continue
+        term = term.strip()
+        if _has_definition(term, defs):
+            continue
+        slug = re.sub(r"[^\w\-]", "-", term.lower())[:60].strip("-")
+        draft_path = inbox / f"def-{slug}.md"
+        if draft_path.exists():
+            continue
+        draft_path.write_text(
+            f"---\ntitle: \"{term}\"\ntype: concept\ntags: [needs_definition]\n"
+            f"created: {today}\nsource: auto\nconfidence: 0.5\nneeds_definition: true\n---\n",
+            "utf-8",
+        )
+        logger.info("Created definition draft: %s", draft_path.name)
 
 
 def _remove_proposed_folder_from_frontmatter(path: Path) -> None:
