@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 VAULT_PATH = os.getenv("VAULT_PATH", "/app/vault")
 INBOX_DIR_NAME = os.getenv("INBOX_DIR_NAME", "_inbox")
-_SKIP_DIRS = {"templates", ".obsidian", ".git", ".lightrag", ".entire", ".trash"}
+_SKIP_DIRS = {"templates", ".obsidian", ".git", ".lightrag", ".entire", ".trash", "_system"}
 
 WIKI_LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 LINKS_SECTION_LINE_RE = re.compile(r"^\s*-\s*\[\[([^\]]+)\]\]\s*$")
@@ -144,16 +144,19 @@ def clean_broken_links(broken_map: dict[str, list[str]]) -> int:
 
         for title in titles:
             escaped = re.escape(title)
+            try:
+                # Remove lines in Links/References sections: `- [[Title]]` (also with #anchor or |display)
+                pattern = re.compile(rf"^\s*-\s*\[\[{escaped}(?:[#|][^\]]*)?\]\]\s*\n?", re.MULTILINE | re.IGNORECASE)
+                content, n = pattern.subn("", content)
+                cleaned_count += n
 
-            # Remove lines in Links/References sections: `- [[Title]]` (also with #anchor or |display)
-            pattern = re.compile(rf"^\s*-\s*\[\[{escaped}(?:[#|][^\]]*)?\]\]\s*\n?", re.MULTILINE | re.IGNORECASE)
-            content, n = pattern.subn("", content)
-            cleaned_count += n
-
-            # Replace remaining inline [[Title]] (also with #anchor or |display) with plain Title
-            inline_pattern = re.compile(rf"\[\[{escaped}(?:[#|][^\]]*)?\]\]", re.IGNORECASE)
-            content, n2 = inline_pattern.subn(title, content)
-            cleaned_count += n2
+                # Replace remaining inline [[Title]] (also with #anchor or |display) with plain Title
+                inline_pattern = re.compile(rf"\[\[{escaped}(?:[#|][^\]]*)?\]\]", re.IGNORECASE)
+                content, n2 = inline_pattern.subn(title, content)
+                cleaned_count += n2
+            except re.error as e:
+                logger.warning("Regex error cleaning link '%s': %s (skipping)", title, e)
+                continue
 
         # Remove empty ## Links section (header with no list items after it)
         content = re.sub(r"\n## Links\s*\n(?=\n|## |\Z)", "\n", content)
