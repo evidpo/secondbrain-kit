@@ -355,6 +355,7 @@ def handle_callback(
                 logger.warning("LightRAG insert after folder create failed: %s", e)
             _update_forward_links(target_path, existing_links)
             _inject_backlinks_for_note(title, existing_links)
+            _ensure_post_approval_links(target_path, folder)
 
         answer_callback(callback_id, f"📂 {title} → {folder}")
         delete_message(chat_id, message_id)

@@ -13,6 +13,8 @@ from lightrag import LightRAG, QueryParam
 from lightrag.llm.gemini import gemini_model_complete, gemini_embed
 from lightrag.utils import EmbeddingFunc
 
+from .path_sync import VAULT_SKIP_DIRS
+
 logger = logging.getLogger(__name__)
 
 _instance: LightRAG | None = None
@@ -454,6 +456,82 @@ def get_related_docs_from_graph(file_path: str, working_dir: str, limit: int = 5
         return []
 
 
+def find_similar_notes(text: str, vault_path: str, limit: int = 3,
+                       exclude_title: str = "") -> list[str]:
+    """Find semantically similar notes by graph + embedding search.
+
+    Returns note TITLES (human-readable, for [[wiki-links]]).
+    Two strategies combined for best coverage:
+      1. KV store graph — free, instant, works for indexed notes
+      2. Embedding search (query_data global) — cheap, covers all content
+
+    Cost: one embedding API call (~$0.001) if graph lookup insufficient.
+    """
+    vault = Path(vault_path)
+    exclude_lower = exclude_title.lower()
+    working_dir = os.getenv("LIGHTRAG_WORKING_DIR", ".lightrag")
+
+    def _path_to_title(file_path: str) -> str | None:
+        """Convert relative vault path to note title."""
+        fp = vault / file_path
+        if not fp.exists():
+            return None
+        try:
+            raw = fp.read_text("utf-8")[:500]
+            if raw.startswith("---"):
+                end = raw.find("---", 3)
+                if end != -1:
+                    for line in raw[3:end].splitlines():
+                        if line.strip().startswith("title:"):
+                            return line.split(":", 1)[1].strip().strip('"').strip("'")
+        except Exception:
+            pass
+        return fp.stem.replace("-", " ").replace("_", " ")
+
+    titles: list[str] = []
+    seen: set[str] = set()
+
+    # Strategy 1: KV store graph (free, instant)
+    try:
+        # Use a dummy file_path to find related docs by shared entities
+        # query_data in local mode returns entities, from which we extract doc links
+        related_paths = get_related_docs_from_graph("__query__", working_dir, limit=limit * 2)
+        for rp in related_paths:
+            title = _path_to_title(rp)
+            if title and title.lower() != exclude_lower and title.lower() not in seen:
+                titles.append(title)
+                seen.add(title.lower())
+                if len(titles) >= limit:
+                    break
+    except Exception as e:
+        logger.debug("Graph-based similar notes failed: %s", e)
+
+    if len(titles) >= limit:
+        return titles[:limit]
+
+    # Strategy 2: Embedding search (cheap — only embedding cost, no LLM)
+    try:
+        data = query_data(text, mode="global", top_k=limit * 2)
+        if isinstance(data, dict):
+            chunks = data.get("chunks", [])
+            for chunk in chunks:
+                if not isinstance(chunk, dict):
+                    continue
+                fp = chunk.get("file_path", "")
+                if not fp:
+                    continue
+                title = _path_to_title(fp)
+                if title and title.lower() != exclude_lower and title.lower() not in seen:
+                    titles.append(title)
+                    seen.add(title.lower())
+                    if len(titles) >= limit:
+                        break
+    except Exception as e:
+        logger.debug("Embedding-based similar notes failed: %s", e)
+
+    return titles[:limit]
+
+
 def sync_with_vault(vault_path: str, skip_dirs: set[str] | None = None,
                     dry_run: bool = False) -> dict:
     """Sync LightRAG graph with actual vault files.
@@ -464,7 +542,7 @@ def sync_with_vault(vault_path: str, skip_dirs: set[str] | None = None,
     """
     vault = Path(vault_path)
     if skip_dirs is None:
-        skip_dirs = {"templates", ".obsidian", ".git", ".lightrag", ".entire", ".trash"}
+        skip_dirs = VAULT_SKIP_DIRS
     inbox = os.getenv("INBOX_DIR_NAME", "_inbox")
 
     # Collect relative paths of all vault files

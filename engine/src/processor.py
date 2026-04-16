@@ -82,32 +82,43 @@ _DEFAULT_FALLBACK_LINK = "Михаил Михайлов"
 def _ensure_links(analysis: dict, raw_text: str, folder: str) -> None:
     """Guarantee at least 1 wiki-link. Mutates analysis['links'] in place.
 
-    Fallback chain:
-      1. Graph-based suggest_links() (no LLM cost)
-      2. Structural link by folder prefix
-      3. Default link to vault owner
+    4-level fallback chain:
+      1. Graph entity matching via suggest_links() (no LLM cost)
+      2. Embedding similarity via find_similar_notes() (embedding cost only)
+      3. Structural link by folder prefix
+      4. Default link to vault owner
     """
     if analysis.get("links"):
         return
 
-    # Fallback 1: graph-based discovery
     existing_titles = {t.lower() for t in get_existing_note_titles(VAULT_PATH)}
     own_title = analysis.get("title", "").lower()
+
+    # Fallback 1: graph entity matching (free, instant)
     fallback = suggest_links(raw_text, VAULT_PATH, limit=3)
     fallback = [l for l in fallback if l.lower() in existing_titles and l.lower() != own_title]
     if fallback:
         analysis["links"] = fallback
-        logger.info("Graph fallback links for '%s': %s", analysis.get("title"), fallback)
+        logger.info("Graph entity fallback for '%s': %s", analysis.get("title"), fallback)
         return
 
-    # Fallback 2: structural link by folder
+    # Fallback 2: embedding similarity (cheap — embedding API only, no LLM)
+    from .lightrag_engine import find_similar_notes
+    similar = find_similar_notes(raw_text, VAULT_PATH, limit=3, exclude_title=own_title)
+    similar = [s for s in similar if s.lower() in existing_titles]
+    if similar:
+        analysis["links"] = similar
+        logger.info("Embedding fallback for '%s': %s", analysis.get("title"), similar)
+        return
+
+    # Fallback 3: structural link by folder prefix
     for prefix, target in STRUCTURAL_LINK_MAP.items():
         if folder.startswith(prefix):
             analysis["links"] = [target]
             logger.info("Structural fallback: '%s' → [[%s]]", analysis.get("title"), target)
             return
 
-    # Fallback 3: default to vault owner
+    # Fallback 4: default to vault owner
     analysis["links"] = [_DEFAULT_FALLBACK_LINK]
     logger.info("Default fallback: '%s' → [[%s]]", analysis.get("title"), _DEFAULT_FALLBACK_LINK)
 

@@ -241,18 +241,18 @@ def _render_note(
 
 def _update_index(vault: Path, repo_name: str, stack_text: str) -> None:
     """Add or update row for this repo in codebase-info/index.md."""
-    index_path = vault / "codebase-info" / "index.md"
+    index_path = vault / "projects" / "codebase-info" / "index.md"
     if not index_path.exists():
         return
 
     content = index_path.read_text(encoding="utf-8")
     key = repo_name.lower()
-    note_link = f"[[codebase-{key}|{repo_name}]]"
+    note_link = f"[[cb-{key}|{repo_name}]]"
     new_row = f"| {note_link} | {stack_text} | active |"
 
-    if f"[[codebase-{key}" in content:
+    if f"[[cb-{key}" in content:
         content = re.sub(
-            rf'\| \[\[codebase-{re.escape(key)}[^\n]+',
+            rf'\| \[\[cb-{re.escape(key)}[^\n]+',
             new_row,
             content,
         )
@@ -288,7 +288,7 @@ def maybe_sync_codebase_info(session_text: str, vault_path: str) -> None:
 
     repo_name = _repo_name(working_dir)
     vault = Path(vault_path)
-    note_path = vault / "codebase-info" / f"codebase-{repo_name.lower()}.md"
+    note_path = vault / "projects" / "codebase-info" / f"cb-{repo_name.lower()}.md"
 
     # Compute current hashes
     new_hashes = _compute_hashes(repo_path)
@@ -308,7 +308,7 @@ def maybe_sync_codebase_info(session_text: str, vault_path: str) -> None:
         logger.info("codebase-info missing, creating: %s", repo_name)
 
     # Preserve existing links section and created date
-    links_section = "## Связи"
+    links_section = "## Связи\n- [[Codebase Index]]"
     created = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if note_exists:
         existing = note_path.read_text(encoding="utf-8")
