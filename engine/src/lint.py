@@ -17,12 +17,12 @@ from .lightrag_engine import (
     delete_doc,
 )
 from .link_integrity import WIKI_LINK_RE, _vault_md_files, _extract_title, clean_broken_links
+from .path_sync import VAULT_SKIP_DIRS
 
 logger = logging.getLogger(__name__)
 
 VAULT_PATH = os.getenv("VAULT_PATH", "/app/vault")
 INBOX_DIR_NAME = os.getenv("INBOX_DIR_NAME", "_inbox")
-_SKIP_DIRS = {"templates", ".obsidian", ".git", ".lightrag", ".entire", ".trash", "_system"}
 
 
 # ---------------------------------------------------------------------------
@@ -37,7 +37,7 @@ def _collect_vault_notes(vault_path: str) -> dict[str, dict]:
     vault = Path(vault_path)
     notes: dict[str, dict] = {}
     for d in vault.iterdir():
-        if not d.is_dir() or d.name in _SKIP_DIRS or d.name.startswith(".") or d.name == INBOX_DIR_NAME:
+        if not d.is_dir() or d.name in VAULT_SKIP_DIRS or d.name.startswith(".") or d.name == INBOX_DIR_NAME:
             continue
         for f in d.rglob("*.md"):
             try:

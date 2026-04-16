@@ -17,10 +17,13 @@ from .lightrag_engine import (
     stats as lightrag_stats,
     sync_with_vault,
 )
+from .approval import handle_callback
 from .processor import process_file
+from .telegram import answer_callback
 from .voice import process_voice
 from .lint import run_lint
 from .index_generator import generate_index, write_index
+from .path_sync import VAULT_SKIP_DIRS
 
 logger = logging.getLogger(__name__)
 
@@ -159,10 +162,9 @@ async def vault_stats(_=Depends(verify_api_key)):
     by_folder = {}
     total = 0
     latest_mtime = 0.0
-    skip = {"templates", ".obsidian", ".git", ".lightrag", ".entire", ".trash"}
 
     for d in vault.iterdir():
-        if not d.is_dir() or d.name in skip or d.name.startswith("."):
+        if not d.is_dir() or d.name in VAULT_SKIP_DIRS or d.name.startswith(".") or d.name == INBOX_DIR_NAME:
             continue
         files = list(d.rglob("*.md"))
         by_folder[d.name] = len(files)
@@ -254,3 +256,192 @@ async def graph_view(entity: str = "", _=Depends(verify_api_key)):
         return {"entity": entity, "context": data}
     stats = lightrag_stats()
     return {"stats": stats}
+
+
+def _reindex_vault() -> dict:
+    """Re-index all vault notes into LightRAG. Shared by API and watcher."""
+    vault = Path(VAULT_PATH)
+    indexed = 0
+    errors = 0
+
+    for d in vault.iterdir():
+        if not d.is_dir() or d.name in VAULT_SKIP_DIRS or d.name.startswith(".") or d.name == INBOX_DIR_NAME:
+            continue
+        for f in d.rglob("*.md"):
+            if f.name.startswith("."):
+                continue
+            try:
+                content = f.read_text(encoding="utf-8")
+                rel_path = str(f.relative_to(vault))
+                lightrag_insert(content, file_path=rel_path)
+                indexed += 1
+            except Exception as e:
+                logger.warning("Reindex failed for %s: %s", f, e)
+                errors += 1
+
+    logger.info("Reindex complete: %d indexed, %d errors", indexed, errors)
+
+    try:
+        from .index_generator import write_index
+        write_index(VAULT_PATH)
+    except Exception as e:
+        logger.warning("Index write after reindex failed: %s", e)
+
+    return {"indexed": indexed, "errors": errors}
+
+
+@app.post("/reindex")
+async def reindex_vault(_=Depends(verify_api_key)):
+    """Re-index all vault notes into LightRAG (rebuild graph)."""
+    return _reindex_vault()
+
+
+def _sync_all_links() -> dict:
+    """Inject missing [[wiki-links]] into all vault notes based on LightRAG graph.
+
+    Uses graph KV stores (no LLM/embedding calls) — works offline.
+    Finds related notes by shared entities in the knowledge graph and injects
+    [[stem-name]] wikilinks into ## Links section.
+    Skips personal-data notes.
+    """
+    from .lightrag_engine import get_related_docs_from_graph
+
+    lightrag_dir = os.getenv("LIGHTRAG_WORKING_DIR", os.path.join(VAULT_PATH, ".lightrag"))
+    vault = Path(VAULT_PATH)
+
+    total_links = 0
+    notes_updated = []
+
+    for d in vault.iterdir():
+        if not d.is_dir() or d.name in VAULT_SKIP_DIRS or d.name.startswith(".") or d.name == INBOX_DIR_NAME:
+            continue
+        for f in d.rglob("*.md"):
+            if f.name.startswith("."):
+                continue
+            try:
+                content = f.read_text("utf-8")
+                if "content_type: personal-data" in content[:500]:
+                    continue
+
+                rel_path = str(f.relative_to(vault))
+                related_paths = get_related_docs_from_graph(rel_path, lightrag_dir, limit=8)
+                if not related_paths:
+                    continue
+
+                new_count = 0
+                for related_path in related_paths:
+                    # Convert path to wikilink title (filename stem)
+                    link_title = Path(related_path).stem
+                    wikilink = f"[[{link_title}]]"
+                    if wikilink in content:
+                        continue
+                    if "\n## Links\n" in content:
+                        content = content.replace(
+                            "\n## Links\n",
+                            f"\n## Links\n- {wikilink}\n",
+                        )
+                    else:
+                        content = content.rstrip("\n") + f"\n\n## Links\n- {wikilink}\n"
+                    new_count += 1
+                    total_links += 1
+
+                if new_count > 0:
+                    f.write_text(content, "utf-8")
+                    notes_updated.append(rel_path)
+
+            except Exception as e:
+                logger.warning("sync-links failed for %s: %s", f, e)
+
+    logger.info("sync-links: %d links added to %d notes", total_links, len(notes_updated))
+
+    # Regenerate _index.md after link changes
+    try:
+        from .index_generator import write_index
+        write_index(VAULT_PATH)
+    except Exception as e:
+        logger.warning("Index write after sync-links failed: %s", e)
+
+    return {"total_links_added": total_links, "notes_updated": notes_updated}
+
+
+@app.post("/sync-links")
+async def sync_links(_=Depends(verify_api_key)):
+    """Inject missing [[wiki-links]] into all vault notes from LightRAG graph.
+
+    Queries each note's content against the knowledge graph, finds related notes,
+    and adds [[Title]] references to ## Links sections. Idempotent — safe to run
+    multiple times. Changes are picked up by git-sync.sh on next run.
+    """
+    return _sync_all_links()
+
+
+@app.post("/dedup-entities")
+async def dedup_entities(dry_run: bool = True, _=Depends(verify_api_key)):
+    """Find and merge duplicate entity names in the LightRAG graph.
+
+    Rules applied automatically (dry_run=false executes merges):
+      - Case variants: "content loop" == "Content Loop"
+      - Definition anchors: aliases from knowledge/definitions/*.md
+      - Path/slug normalization: "mihailov-flow" == "@mihailov_flow"
+
+    WARN-only (never auto-merged):
+      - Fuzzy token overlap (Jaccard >= 0.70)
+
+    Query params:
+      dry_run=true  (default) — report only, no merges
+      dry_run=false — execute merges
+    """
+    import asyncio
+    from .graph_dedup import run_dedup
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None, lambda: run_dedup(vault_path=VAULT_PATH, dry_run=dry_run)
+    )
+    return result
+
+
+@app.post("/reindex-sync")
+async def reindex_sync(_=Depends(verify_api_key)):
+    """Delete orphan docs from graph (docs with no matching vault file).
+
+    Safe to call manually. Does NOT auto-delete on periodic sync.
+    """
+    from .lightrag_engine import sync_with_vault
+    result = sync_with_vault(VAULT_PATH, dry_run=False)
+    logger.info("Manual sync: deleted %d orphans", len(result["deleted"]))
+    return {
+        "deleted": len(result["deleted"]),
+        "orphans_removed": result["deleted"],
+        "kept": result["kept"],
+    }
+
+
+# --- Telegram callback webhook (called by openclaw-gateway) ---
+
+_SECONDBRAIN_PREFIXES = {"a", "r", "k", "f", "d", "o"}
+
+
+class TelegramCallbackRequest(BaseModel):
+    action: str
+    slug: str
+    callback_id: str
+    chat_id: str
+    message_id: int
+
+
+@app.post("/telegram/callback")
+async def telegram_callback(req: TelegramCallbackRequest):
+    """Handle Telegram inline button callback routed from openclaw."""
+    logger.info("Callback: action=%s slug=%s chat_id=%s msg_id=%s", req.action, req.slug, req.chat_id, req.message_id)
+    if req.action not in _SECONDBRAIN_PREFIXES:
+        raise HTTPException(400, "Unknown action")
+    try:
+        handle_callback(
+            req.action, req.slug,
+            req.callback_id, req.chat_id, req.message_id,
+        )
+        return {"ok": True}
+    except Exception as e:
+        logger.error("Callback handler error: %s", e)
+        answer_callback(req.callback_id, "❌ Ошибка")
+        raise HTTPException(500, str(e))
