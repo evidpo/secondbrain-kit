@@ -8,12 +8,17 @@ Zero API calls, pure file I/O, under 1 second.
 
 import json
 import os
+import sys
 from pathlib import Path
 
 MAX_NOTES = int(os.environ.get("SB_MAX_NOTES", "50"))
 
 
 def main():
+    flag_file = Path.home() / ".claude" / ".sb-hook-disabled"
+    if flag_file.exists() or os.environ.get("SB_HOOK_DISABLED") == "1":
+        sys.exit(0)
+
     vault_path = os.environ.get("VAULT_PATH", os.path.expanduser("~/coding/SecondBrain"))
     index_path = Path(vault_path) / "_index.md"
 
