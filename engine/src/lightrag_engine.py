@@ -35,6 +35,9 @@ def _get_config() -> dict:
         "chunk_size": int(os.getenv("LIGHTRAG_CHUNK_SIZE", "1200")),
         # NanoVectorDBStorage (local dev) or QdrantVectorDBStorage (production)
         "vector_storage": os.getenv("LIGHTRAG_VECTOR_STORAGE", "NanoVectorDBStorage"),
+        # JsonKVStorage (local dev) or PGKVStorage (production, atomic writes)
+        "kv_storage": os.getenv("LIGHTRAG_KV_STORAGE") or "JsonKVStorage",
+        "doc_status_storage": os.getenv("LIGHTRAG_DOC_STATUS_STORAGE") or "JsonDocStatusStorage",
     }
 
 
@@ -204,6 +207,8 @@ async def _create_instance() -> LightRAG:
         embedding_func_max_async=16,
         chunk_token_size=cfg["chunk_size"],
         vector_storage=cfg["vector_storage"],
+        kv_storage=cfg["kv_storage"],
+        doc_status_storage=cfg["doc_status_storage"],
         addon_params={
             "language": "Russian",
             "entity_extraction_context": ctx_str,
@@ -211,9 +216,10 @@ async def _create_instance() -> LightRAG:
     )
     await rag.initialize_storages()
     logger.info(
-        "LightRAG initialized: working_dir=%s llm=%s embedding=%s dim=%d storage=%s",
-        working_dir, llm_backend, cfg["embedding_model"],
-        cfg["embedding_dim"], cfg["vector_storage"],
+        "LightRAG initialized: working_dir=%s llm=%s embedding=%s dim=%d "
+        "vector=%s kv=%s doc_status=%s",
+        working_dir, llm_backend, cfg["embedding_model"], cfg["embedding_dim"],
+        cfg["vector_storage"], cfg["kv_storage"], cfg["doc_status_storage"],
     )
     return rag
 
@@ -226,6 +232,37 @@ def get_instance() -> LightRAG:
     return _instance
 
 
+def _doc_field(info, name: str):
+    """Read a field from a doc_status record (dataclass or dict)."""
+    val = getattr(info, name, None)
+    if val is None and isinstance(info, dict):
+        val = info.get(name)
+    return val
+
+
+def _all_docs_dict(rag: "LightRAG", page_size: int = 1000) -> dict:
+    """Return all doc_status records as {doc_id: status_obj}.
+
+    Uses legacy `_data` for JsonDocStatusStorage (instant) and
+    `get_docs_paginated` for PG-backed storage (paginated loop).
+    """
+    if hasattr(rag.doc_status, "_data"):
+        return dict(rag.doc_status._data)
+
+    items: dict = {}
+    page = 1
+    while True:
+        batch, _total = _run_sync(
+            rag.doc_status.get_docs_paginated(page=page, page_size=page_size)
+        )
+        for doc_id, info in batch:
+            items[doc_id] = info
+        if len(batch) < page_size:
+            break
+        page += 1
+    return items
+
+
 def _cleanup_failed_docs_for_path(rag: "LightRAG", file_path: str) -> int:
     """Delete failed or dup- doc_status records for a given file path.
 
@@ -236,17 +273,16 @@ def _cleanup_failed_docs_for_path(rag: "LightRAG", file_path: str) -> int:
 
     Returns: number of records deleted.
     """
-    if not hasattr(rag.doc_status, "_data"):
+    try:
+        all_docs = _all_docs_dict(rag)
+    except Exception as e:
+        logger.warning("Pre-insert cleanup: failed to enumerate doc_status: %s", e)
         return 0
 
     to_delete = []
-    for doc_id, info in list(rag.doc_status._data.items()):
-        stored_path = getattr(info, "file_path", None) or (
-            info.get("file_path") if isinstance(info, dict) else None
-        )
-        status = getattr(info, "status", None) or (
-            info.get("status") if isinstance(info, dict) else None
-        )
+    for doc_id, info in all_docs.items():
+        stored_path = _doc_field(info, "file_path")
+        status = _doc_field(info, "status")
         if stored_path == file_path and (
             doc_id.startswith("dup-") or str(status) in ("failed", "error")
         ):
@@ -374,12 +410,12 @@ def get_indexed_doc_ids() -> dict[str, str]:
     """
     rag = get_instance()
     try:
+        all_docs = _all_docs_dict(rag)
         docs = {}
-        if hasattr(rag.doc_status, '_data'):
-            for doc_id, info in rag.doc_status._data.items():
-                summary = info.get("content_summary", "")
-                first_line = summary.split("\n")[0][:100] if summary else ""
-                docs[doc_id] = first_line
+        for doc_id, info in all_docs.items():
+            summary = _doc_field(info, "content_summary") or ""
+            first_line = summary.split("\n")[0][:100] if summary else ""
+            docs[doc_id] = first_line
         return docs
     except Exception as e:
         logger.warning("Failed to get indexed docs: %s", e)
@@ -396,14 +432,12 @@ def get_indexed_paths() -> dict[str, str]:
     """
     rag = get_instance()
     try:
+        all_docs = _all_docs_dict(rag)
         paths: dict[str, str] = {}
-        if hasattr(rag.doc_status, "_data"):
-            for doc_id, info in rag.doc_status._data.items():
-                stored_path = getattr(info, "file_path", None) or (
-                    info.get("file_path") if isinstance(info, dict) else None
-                )
-                if stored_path:
-                    paths[stored_path] = doc_id
+        for doc_id, info in all_docs.items():
+            stored_path = _doc_field(info, "file_path")
+            if stored_path:
+                paths[stored_path] = doc_id
         return paths
     except Exception as e:
         logger.warning("Failed to get indexed paths: %s", e)
@@ -426,13 +460,9 @@ def find_doc_id_by_path(rel_path: str) -> str | None:
     """Find doc_id in LightRAG by file path (relative to vault)."""
     rag = get_instance()
     try:
-        if not hasattr(rag.doc_status, '_data'):
-            return None
-        for doc_id, info in rag.doc_status._data.items():
-            stored = getattr(info, "file_path", None) or (
-                info.get("file_path") if isinstance(info, dict) else None
-            )
-            if stored and stored == rel_path:
+        all_docs = _all_docs_dict(rag)
+        for doc_id, info in all_docs.items():
+            if _doc_field(info, "file_path") == rel_path:
                 return doc_id
     except Exception as e:
         logger.warning("Failed to find doc by path %s: %s", rel_path, e)
@@ -458,27 +488,27 @@ def compute_doc_id(content: str) -> str:
 def get_related_docs_from_graph(file_path: str, working_dir: str, limit: int = 5) -> list[str]:
     """Find documents related to a given file via shared LightRAG entities.
 
-    Uses local KV store files — no LLM/embedding calls required.
-    Returns list of relative file paths (e.g. 'knowledge/definitions/законы-логики.md').
+    Reads `kv_store_entity_chunks.json` and `kv_store_text_chunks.json` from
+    `working_dir`. Works only with `JsonKVStorage` backend — when KV is on
+    Postgres, the files are absent and this returns []. Caller (api._sync_all_links)
+    should treat empty result as "graph-based linking unavailable, skip".
     """
-    try:
-        wdir = Path(working_dir)
-        ec_file = wdir / "kv_store_entity_chunks.json"
-        tc_file = wdir / "kv_store_text_chunks.json"
-        if not ec_file.exists() or not tc_file.exists():
-            return []
+    wdir = Path(working_dir)
+    ec_file = wdir / "kv_store_entity_chunks.json"
+    tc_file = wdir / "kv_store_text_chunks.json"
+    if not ec_file.exists() or not tc_file.exists():
+        return []
 
+    try:
         entity_chunks = json.loads(ec_file.read_text("utf-8"))
         text_chunks = json.loads(tc_file.read_text("utf-8"))
 
-        # Build: chunk_id → file_path
         chunk_to_doc: dict[str, str] = {}
         for chunk_id, info in text_chunks.items():
             fp = info.get("file_path") if isinstance(info, dict) else None
             if fp:
                 chunk_to_doc[chunk_id] = fp
 
-        # Build: entity_name → set(file_paths)
         entity_to_docs: dict[str, set[str]] = {}
         for entity_name, data in entity_chunks.items():
             chunk_ids = data.get("chunk_ids", []) if isinstance(data, dict) else []
@@ -486,19 +516,16 @@ def get_related_docs_from_graph(file_path: str, working_dir: str, limit: int = 5
             if docs:
                 entity_to_docs[entity_name] = docs
 
-        # Find entities in this document
         doc_entities = {e for e, docs in entity_to_docs.items() if file_path in docs}
         if not doc_entities:
             return []
 
-        # Count shared entities per related document
         related: dict[str, int] = {}
         for entity in doc_entities:
             for other_doc in entity_to_docs.get(entity, set()):
                 if other_doc != file_path:
                     related[other_doc] = related.get(other_doc, 0) + 1
 
-        # Sort by number of shared entities
         return [doc for doc, _ in sorted(related.items(), key=lambda x: -x[1])[:limit]]
 
     except Exception as e:
@@ -508,18 +535,13 @@ def get_related_docs_from_graph(file_path: str, working_dir: str, limit: int = 5
 
 def find_similar_notes(text: str, vault_path: str, limit: int = 3,
                        exclude_title: str = "") -> list[str]:
-    """Find semantically similar notes by graph + embedding search.
+    """Find semantically similar notes by embedding search.
 
     Returns note TITLES (human-readable, for [[wiki-links]]).
-    Two strategies combined for best coverage:
-      1. KV store graph — free, instant, works for indexed notes
-      2. Embedding search (query_data global) — cheap, covers all content
-
-    Cost: one embedding API call (~$0.001) if graph lookup insufficient.
+    Cost: one embedding API call (~$0.001) per call.
     """
     vault = Path(vault_path)
     exclude_lower = exclude_title.lower()
-    working_dir = os.getenv("LIGHTRAG_WORKING_DIR", ".lightrag")
 
     def _path_to_title(file_path: str) -> str | None:
         """Convert relative vault path to note title."""
@@ -541,25 +563,6 @@ def find_similar_notes(text: str, vault_path: str, limit: int = 3,
     titles: list[str] = []
     seen: set[str] = set()
 
-    # Strategy 1: KV store graph (free, instant)
-    try:
-        # Use a dummy file_path to find related docs by shared entities
-        # query_data in local mode returns entities, from which we extract doc links
-        related_paths = get_related_docs_from_graph("__query__", working_dir, limit=limit * 2)
-        for rp in related_paths:
-            title = _path_to_title(rp)
-            if title and title.lower() != exclude_lower and title.lower() not in seen:
-                titles.append(title)
-                seen.add(title.lower())
-                if len(titles) >= limit:
-                    break
-    except Exception as e:
-        logger.debug("Graph-based similar notes failed: %s", e)
-
-    if len(titles) >= limit:
-        return titles[:limit]
-
-    # Strategy 2: Embedding search (cheap — only embedding cost, no LLM)
     try:
         data = query_data(text, mode="global", top_k=limit * 2)
         if isinstance(data, dict):

@@ -8,3 +8,5 @@ gitpython>=3.1
 lightrag-hku[api]>=1.4.0,<2.0
 google-genai>=1.0
 mcp>=1.0
+asyncpg>=0.29
+pgvector>=0.3
