@@ -153,6 +153,10 @@ class FrontmatterCache:
         """Return {title: rel_path} for conflict detection."""
         return {v["title"]: k for k, v in self._data.items() if v.get("title")}
 
+    def paths_with_title(self, title: str) -> list[str]:
+        """All cached paths whose title equals `title` (for ambiguity detection)."""
+        return [p for p, v in self._data.items() if v.get("title") == title]
+
     def build(self, vault_path: str):
         """Full scan of vault to build/rebuild cache."""
         self._data = {}
@@ -312,6 +316,21 @@ def _reindex_in_lightrag(file_path: Path, vault_path: str):
 
 
 # ---------------------------------------------------------------------------
+# Ambiguity check
+# ---------------------------------------------------------------------------
+
+def _ambiguous_old_title(
+    cache: FrontmatterCache, old_title: str, self_path: str
+) -> list[str]:
+    """Other cached paths still holding `old_title`.
+
+    If non-empty, rewriting [[old_title]] -> [[new_title]] would silently
+    redirect links that legitimately resolve to those other notes.
+    """
+    return [p for p in cache.paths_with_title(old_title) if p != self_path]
+
+
+# ---------------------------------------------------------------------------
 # Event handlers (called from watcher)
 # ---------------------------------------------------------------------------
 
@@ -357,8 +376,18 @@ def handle_move(src_path: str, dest_path: str, cache: FrontmatterCache):
 
     # Update wiki-links if title changed
     link_count = 0
+    skipped_ambiguous: list[str] = []
     if old_title and new_title and old_title != new_title:
-        link_count = update_wiki_links(old_title, new_title, VAULT_PATH)
+        skipped_ambiguous = _ambiguous_old_title(cache, old_title, old_rel)
+        if skipped_ambiguous:
+            msg = (
+                f"⚠️ Ambiguous rename: «{old_title}» still used by "
+                f"{', '.join(skipped_ambiguous)}. Wiki-links NOT updated."
+            )
+            logger.warning(msg)
+            _notify_telegram(msg)
+        else:
+            link_count = update_wiki_links(old_title, new_title, VAULT_PATH)
 
     # Update cache
     cache.remove(old_rel)
@@ -375,7 +404,7 @@ def handle_move(src_path: str, dest_path: str, cache: FrontmatterCache):
         pass
 
     # Notify
-    if old_title and new_title and old_title != new_title:
+    if old_title and new_title and old_title != new_title and not skipped_ambiguous:
         _notify_telegram(
             f"\U0001f4dd Rename: \u00ab{old_title}\u00bb \u2192 \u00ab{new_title}\u00bb. "
             f"Links updated: {link_count}."
@@ -383,7 +412,7 @@ def handle_move(src_path: str, dest_path: str, cache: FrontmatterCache):
         logger.info(
             "Path sync: '%s' -> '%s', %d links updated", old_title, new_title, link_count
         )
-    else:
+    elif old_title == new_title:
         logger.info("Path sync: moved %s -> %s (title unchanged)", old_rel, new_rel)
 
 
@@ -429,6 +458,21 @@ def handle_modify(file_path: str, cache: FrontmatterCache):
         logger.warning(msg)
         _notify_telegram(msg)
         cache.set(rel, new_title, new_hash)
+        return
+
+    # Ambiguity check: another file still holds old_title \u2014 wiki-link rewrite
+    # would silently redirect links that legitimately point at the other note.
+    ambiguous = _ambiguous_old_title(cache, old_title, rel)
+    if ambiguous:
+        msg = (
+            f"\u26a0\ufe0f Ambiguous rename: \u00ab{old_title}\u00bb still used by "
+            f"{', '.join(ambiguous)}. Wiki-links NOT updated."
+        )
+        logger.warning(msg)
+        _notify_telegram(msg)
+        cache.set(rel, new_title, new_hash)
+        if old_hash != new_hash:
+            _reindex_in_lightrag(p, VAULT_PATH)
         return
 
     link_count = update_wiki_links(old_title, new_title, VAULT_PATH)
@@ -520,10 +564,20 @@ def sync_paths(cache: FrontmatterCache, vault_path: str | None = None) -> dict:
             # Conflict check
             titles = cache.titles_map()
             conflict = titles.get(new_title)
+            ambiguous = _ambiguous_old_title(cache, old_title, old_path)
             if conflict and conflict != old_path and conflict != new_path:
                 warn = (
                     f"Title conflict: '{new_title}' already at {conflict}. "
                     f"Links not updated for rename {old_path} -> {new_path}."
+                )
+                results["warnings"].append(warn)
+                logger.warning(warn)
+                _notify_telegram(f"\u26a0\ufe0f {warn}")
+            elif ambiguous:
+                warn = (
+                    f"Ambiguous rename: '{old_title}' still used by "
+                    f"{', '.join(ambiguous)}. Links not updated for "
+                    f"rename {old_path} -> {new_path}."
                 )
                 results["warnings"].append(warn)
                 logger.warning(warn)
@@ -570,6 +624,20 @@ def sync_paths(cache: FrontmatterCache, vault_path: str | None = None) -> dict:
             logger.warning(warn)
             _notify_telegram(f"\u26a0\ufe0f {warn}")
             cache.set(path, new_title, new_entry["body_hash"])
+            continue
+
+        ambiguous = _ambiguous_old_title(cache, old_title, path)
+        if ambiguous:
+            warn = (
+                f"Ambiguous rename: '{old_title}' still used by "
+                f"{', '.join(ambiguous)}. Links not updated for {path}."
+            )
+            results["warnings"].append(warn)
+            logger.warning(warn)
+            _notify_telegram(f"\u26a0\ufe0f {warn}")
+            cache.set(path, new_title, new_entry["body_hash"])
+            if old_entry["body_hash"] != new_entry["body_hash"]:
+                _reindex_in_lightrag(vault / path, vault_path)
             continue
 
         link_count = update_wiki_links(old_title, new_title, vault_path)
