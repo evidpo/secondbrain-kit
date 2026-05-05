@@ -71,7 +71,7 @@ async def _rotating_gemini_embed(texts, **kwargs):
     global _embed_idx
     keys = _embed_keys()
     if len(keys) <= 1:
-        return await gemini_embed(texts, **kwargs)
+        return await gemini_embed.func(texts, **kwargs)
 
     n = len(keys)
     last_err: Exception | None = None
@@ -88,7 +88,7 @@ async def _rotating_gemini_embed(texts, **kwargs):
         _embed_idx = (chosen + 1) % n
 
         try:
-            return await gemini_embed(texts, api_key=keys[chosen], **kwargs)
+            return await gemini_embed.func(texts, api_key=keys[chosen], **kwargs)
         except Exception as e:
             msg = str(e)
             if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
