@@ -15,7 +15,7 @@ import yaml as yaml_lib
 
 from .path_sync import VAULT_SKIP_DIRS
 
-_client: genai.Client | None = None
+_client: "_RotatingClient | None" = None
 _existing_notes_cache: list[str] | None = None
 _existing_tags_cache: set[str] | None = None
 _note_types_cache: dict[str, str] | None = None
@@ -73,10 +73,80 @@ def _is_anchor_hub_note(text: str) -> bool:
 
 
 
-def _get_client() -> genai.Client:
+class _RotatingClient:
+    """Drop-in replacement for genai.Client that round-robins across multiple
+    API keys. On 429 RESOURCE_EXHAUSTED, marks key as exhausted (using server-
+    provided retryDelay) and tries next key. Falls back to single-key behaviour
+    if only one key is configured.
+
+    Configure via env:
+      GEMINI_API_KEYS=key1,key2,key3   (preferred, comma-separated)
+      GEMINI_API_KEY=key1               (single-key fallback)
+    """
+
+    def __init__(self, keys: list[str]):
+        import time
+        self._clients = [genai.Client(api_key=k) for k in keys]
+        self._exhausted_until: dict[int, float] = {}
+        self._idx = 0
+        self.models = _RotatingModels(self)
+        logger.info("Gemini key pool initialized: %d key(s)", len(self._clients))
+
+    def _pick_client(self) -> tuple[int, "genai.Client"]:
+        import time
+        now = time.time()
+        n = len(self._clients)
+        for offset in range(n):
+            i = (self._idx + offset) % n
+            if self._exhausted_until.get(i, 0) <= now:
+                self._idx = (i + 1) % n
+                return i, self._clients[i]
+        # All exhausted — pick the one resetting soonest (caller will likely 429 too).
+        i = min(self._exhausted_until, key=self._exhausted_until.get)
+        return i, self._clients[i]
+
+
+class _RotatingModels:
+    def __init__(self, parent: "_RotatingClient"):
+        self._parent = parent
+
+    def generate_content(self, **kwargs):
+        import re
+        import time
+        last_err = None
+        attempts = len(self._parent._clients)
+        for _ in range(attempts):
+            i, client = self._parent._pick_client()
+            try:
+                return client.models.generate_content(**kwargs)
+            except Exception as e:
+                msg = str(e)
+                if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                    m = re.search(r"retry in (\d+(?:\.\d+)?)s", msg)
+                    delay = float(m.group(1)) if m else 60.0
+                    self._parent._exhausted_until[i] = time.time() + delay
+                    logger.warning(
+                        "Gemini key #%d exhausted, rotating (resets in %.0fs)",
+                        i, delay,
+                    )
+                    last_err = e
+                    continue
+                raise
+        raise last_err
+
+
+def _get_client() -> "_RotatingClient":
     global _client
     if _client is None:
-        _client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        keys_env = os.getenv("GEMINI_API_KEYS", "").strip()
+        if keys_env:
+            keys = [k.strip() for k in keys_env.split(",") if k.strip()]
+        else:
+            single = os.getenv("GEMINI_API_KEY", "").strip()
+            keys = [single] if single else []
+        if not keys:
+            raise RuntimeError("No Gemini API keys configured (set GEMINI_API_KEYS or GEMINI_API_KEY)")
+        _client = _RotatingClient(keys)
     return _client
 
 
