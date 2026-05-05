@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import threading
+import time
 from pathlib import Path
 
 from lightrag import LightRAG, QueryParam
@@ -24,6 +25,85 @@ _thread: threading.Thread | None = None
 _loop_lock = threading.Lock()
 
 _TIMEOUT = int(os.getenv("LIGHTRAG_TIMEOUT", "300"))
+
+# --- Embedding-side Gemini key rotation (mirrors src.linker for LLM calls) ---
+# Free-tier embedding quota is 1000 req/day per project. Rotation across
+# multiple project keys multiplies effective quota linearly.
+_embed_keys_cache: list[str] | None = None
+_embed_idx = 0
+_embed_exhausted_until: dict[int, float] = {}
+
+
+def _embed_keys() -> list[str]:
+    """Resolve and cache embedding keys from env (comma-separated or single)."""
+    global _embed_keys_cache
+    if _embed_keys_cache is None:
+        keys_env = os.getenv("GEMINI_API_KEYS", "").strip()
+        if keys_env:
+            _embed_keys_cache = [k.strip() for k in keys_env.split(",") if k.strip()]
+        else:
+            single = (
+                os.getenv("LLM_BINDING_API_KEY")
+                or os.getenv("GEMINI_API_KEY")
+                or ""
+            ).strip()
+            _embed_keys_cache = [single] if single else []
+        if len(_embed_keys_cache) > 1:
+            logger.info(
+                "Embedding key pool initialized: %d key(s)",
+                len(_embed_keys_cache),
+            )
+    return _embed_keys_cache
+
+
+async def _rotating_gemini_embed(texts, **kwargs):
+    """Embedding wrapper that rotates across `GEMINI_API_KEYS` on 429.
+
+    Falls back to single-key behaviour when only one key is configured —
+    in that case it just delegates to lightrag.llm.gemini.gemini_embed
+    without explicit api_key, preserving original behaviour.
+
+    On 429 RESOURCE_EXHAUSTED, parses the server's retryDelay, marks the
+    offending key as exhausted until then, and tries the next key. If
+    every key is exhausted, picks the one resetting soonest (caller will
+    likely 429 too — this is graceful degradation, not a quota bypass).
+    """
+    global _embed_idx
+    keys = _embed_keys()
+    if len(keys) <= 1:
+        return await gemini_embed(texts, **kwargs)
+
+    n = len(keys)
+    last_err: Exception | None = None
+    for _attempt in range(n):
+        now = time.time()
+        chosen = None
+        for offset in range(n):
+            i = (_embed_idx + offset) % n
+            if _embed_exhausted_until.get(i, 0) <= now:
+                chosen = i
+                break
+        if chosen is None:
+            chosen = min(_embed_exhausted_until, key=_embed_exhausted_until.get)
+        _embed_idx = (chosen + 1) % n
+
+        try:
+            return await gemini_embed(texts, api_key=keys[chosen], **kwargs)
+        except Exception as e:
+            msg = str(e)
+            if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                m = re.search(r"retry in (\d+(?:\.\d+)?)s", msg)
+                delay = float(m.group(1)) if m else 60.0
+                _embed_exhausted_until[chosen] = time.time() + delay
+                logger.warning(
+                    "Embedding key #%d exhausted, rotating (resets in %.0fs)",
+                    chosen, delay,
+                )
+                last_err = e
+                continue
+            raise
+    assert last_err is not None
+    raise last_err
 
 
 def _get_config() -> dict:
@@ -201,7 +281,7 @@ async def _create_instance() -> LightRAG:
         embedding_func=EmbeddingFunc(
             embedding_dim=cfg["embedding_dim"],
             max_token_size=2048,
-            func=gemini_embed.func,
+            func=_rotating_gemini_embed,
             model_name=cfg["embedding_model"],
         ),
         embedding_func_max_async=16,
